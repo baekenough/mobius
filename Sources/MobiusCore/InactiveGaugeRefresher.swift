@@ -62,6 +62,11 @@ extension AccountStore: GaugeSecretStore {}
 /// TOCTOU 재확인·capture-or-nothing 저장 같은 **자격증명 안전 불변식이 테스트 밖에** 있었고,
 /// 세 번째 프로바이더는 이 120여 줄을 통째로 복제해야 했다. 코어로 끌어내려 두 문제를 함께 푼다.
 ///
+/// `@MainActor`인 것은 의도다 — 이 루프는 원래 `AppState`(메인 액터)에서 돌았고, `AccountStore`의
+/// credential lock은 **동기** NSLock이라 `Switcher.switchTo`와 같은 액터에서 상호배제될 때만
+/// 의미가 있다. 실행 컨텍스트를 옮기면 그 락 순서 계약이 함께 바뀌므로 이 PR에서는 건드리지 않았다
+/// (스냅샷 읽기/쓰기는 계정당 수 KB로, 기존과 동일한 비용이다).
+///
 /// 대상은 **비활성 계정만**이다 — 활성 계정을 refresh하면 실행 중인 CLI 세션이 메모리에 든
 /// 시작 시점 토큰이 서버 회전으로 무효화된다(클로버 → 세션 파괴). 호출측이 활성/전환중 계정을
 /// 걸러 넘기고, 이 루프가 저장 직전 credential lock 안에서 **다시** 확인한다.
@@ -136,7 +141,8 @@ public final class InactiveGaugeRefresher {
                 // ★ 취소 쉴드: refresh POST는 서버에서 refresh 토큰을 **회전**시킨다. 왕복 중에
                 //   취소되면 회전본을 못 받아 저장 스냅샷의 구 토큰이 죽고 계정이 벽돌이 된다.
                 //   자식 Task로 감싸 상위 취소가 전파되지 않게 한다.
-                let outcome = await Task { await self.adapter.refresh(secret: secret) }.value
+                let adapter = self.adapter   // 쉴드 Task가 self를 잡지 않도록 값만 캡처
+                let outcome = await Task { await adapter.refresh(secret: secret) }.value
                 switch outcome {
                 case .refreshed(let rotated):
                     // ★ 원자 capture: credential lock 안에서 (1) 활성 재확인(TOCTOU — 그 사이
@@ -179,10 +185,10 @@ public final class InactiveGaugeRefresher {
         return updated
     }
 
-    // MARK: 테스트 관찰용 (백오프가 실제로 걸렸는지)
+    // MARK: 테스트 관찰용 (백오프가 실제로 걸렸는지) — 공개 API 아님(@testable로만 보인다)
 
     /// 죽은 토큰 백오프가 걸린 시각 — 이 시각 전까지는 refresh/probe를 건너뛴다.
-    public func deadBackoffUntil(_ id: UUID) -> Date? { deadUntil[id] }
+    func deadBackoffUntil(_ id: UUID) -> Date? { deadUntil[id] }
     /// 마지막 refresh 시도 시각 — 성공하면 해제(nil)된다.
-    public func lastRefreshAttempt(_ id: UUID) -> Date? { lastRefreshAttemptAt[id] }
+    func lastRefreshAttempt(_ id: UUID) -> Date? { lastRefreshAttemptAt[id] }
 }

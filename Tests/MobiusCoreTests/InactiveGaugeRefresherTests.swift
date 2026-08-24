@@ -26,7 +26,8 @@ final class InactiveGaugeRefresherTests: XCTestCase {
         var secrets: [UUID: Data] = [:]
         var writes: [(UUID, Data)] = []
         /// 락 진입 시점에 호출 — "HTTP 왕복 중 스냅샷이 바뀌는" 상황을 주입한다.
-        var onLockEnter: (() -> Void)?
+        /// 자기 자신을 인자로 넘겨, 훅이 스토어를 캡처해 참조 순환을 만들지 않게 한다.
+        var onLockEnter: ((FakeStore) -> Void)?
 
         func secretData(for id: UUID) throws -> Data? { secrets[id] }
 
@@ -37,7 +38,7 @@ final class InactiveGaugeRefresherTests: XCTestCase {
 
         @discardableResult
         func withCredentialLock<T>(_ id: UUID, _ body: () throws -> T) rethrows -> T {
-            onLockEnter?()
+            onLockEnter?(self)
             return try body()
         }
     }
@@ -67,9 +68,16 @@ final class InactiveGaugeRefresherTests: XCTestCase {
     let rotated = rotatedSecret
 
     /// 관찰용 카운터를 공유하기 위한 참조 상자 (스텁이 struct라 값 캡처가 안 되므로).
+    /// 테스트는 전부 메인 액터에서 직렬로 돌아 실제 경합은 없다.
     final class Counters: @unchecked Sendable {
         var refreshCalls = 0
         var probedBytes: [Data] = []
+    }
+
+    /// @Sendable 스텁 클로저가 관찰값을 쓰기 위한 상자 — 지역 var 직접 변형(Swift 6 금지)을 피한다.
+    final class Box<T>: @unchecked Sendable {
+        var value: T
+        init(_ value: T) { self.value = value }
     }
 
     private func makeRefresher(store: FakeStore,
@@ -160,13 +168,13 @@ final class InactiveGaugeRefresherTests: XCTestCase {
     func testRotatedSecretDiscardedWhenAccountBecameActiveDuringRefresh() async {
         let store = FakeStore(); store.secrets[id] = fresh
         let counters = Counters()
-        var becameActive = false
+        let becameActive = Box(false)
         let sut = makeRefresher(store: store, counters: counters, expired: true,
-                                refresh: { _ in becameActive = true; return .refreshed(rotatedSecret) },
+                                refresh: { _ in becameActive.value = true; return .refreshed(rotatedSecret) },
                                 probe: { _ in .usage(makeSnapshot(40)) })
 
         let updated = await sut.refreshRound(targets: [target], now: now,
-                                             activeID: { becameActive ? accountID : nil },
+                                             activeID: { becameActive.value ? accountID : nil },
                                              excludedID: { nil })
 
         XCTAssertTrue(store.writes.isEmpty, "활성이 됐으면 라이브 자격증명이 authoritative")
@@ -180,7 +188,7 @@ final class InactiveGaugeRefresherTests: XCTestCase {
     func testRotatedSecretDiscardedWhenSnapshotChangedDuringRefresh() async {
         let store = FakeStore(); store.secrets[id] = fresh
         let relogin = Data("relogin-token".utf8)
-        store.onLockEnter = { store.secrets[accountID] = relogin }
+        store.onLockEnter = { $0.secrets[accountID] = relogin }
         let counters = Counters()
         let sut = makeRefresher(store: store, counters: counters, expired: true,
                                 refresh: { _ in .refreshed(rotatedSecret) })
@@ -212,15 +220,15 @@ final class InactiveGaugeRefresherTests: XCTestCase {
     func testAcceptsRotatedSecretReceivesProfileEmail() async {
         let store = FakeStore(); store.secrets[id] = fresh
         let counters = Counters()
-        var seenEmail: String?
+        let seenEmail = Box<String?>(nil)
         let sut = makeRefresher(store: store, counters: counters, expired: true,
                                 refresh: { _ in .refreshed(rotatedSecret) },
-                                accepts: { _, email in seenEmail = email; return true })
+                                accepts: { _, email in seenEmail.value = email; return true })
 
         _ = await sut.refreshRound(targets: [target], now: now,
                                    activeID: { nil }, excludedID: { nil })
 
-        XCTAssertEqual(seenEmail, email, "검증 기준은 그 계정의 이메일이어야 한다")
+        XCTAssertEqual(seenEmail.value, email, "검증 기준은 그 계정의 이메일이어야 한다")
     }
 
     // MARK: 죽은 refresh 토큰 — 마킹 없이 긴 백오프만
