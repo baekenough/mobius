@@ -25,15 +25,15 @@ final class AppState: ObservableObject {
     // (InactiveGaugeRefresher: 만료 판정 → refresh → 원자 검증 저장 → probe). 게이지 전용
     // (마킹 없음)이며, 프로바이더가 늘어나도 어댑터 하나와 아래 항목 한 줄만 추가하면 된다.
     private var gaugeTasks: [Provider: Task<Void, Never>] = [:]
-    private lazy var gaugeRefreshers: [Provider: InactiveGaugeRefresher] = [
-        .codex: InactiveGaugeRefresher(adapter: CodexGaugeAdapter(io: codexIO),
-                                       store: store,
-                                       retryCooldown: Self.usageRefreshRetryCooldown,
-                                       deadRefreshCooldown: Self.deadGaugeRefreshCooldown),
-    ]
-    // refresh 토큰이 폐기된(죽은) 계정의 긴 백오프 — 어차피 401이므로 이 시각 전까지
-    // refresh/probe를 아예 건너뛴다(게이지는 마지막 값에 둔다).
-    static let deadGaugeRefreshCooldown: TimeInterval = 24 * 3600
+    // 키는 어댑터의 provider에서 유도한다 — 키와 어댑터가 어긋날 여지를 아예 없앤다.
+    private lazy var gaugeRefreshers: [Provider: InactiveGaugeRefresher] = {
+        let all = [
+            InactiveGaugeRefresher(adapter: CodexGaugeAdapter(io: codexIO),
+                                   store: store,
+                                   retryCooldown: Self.usageRefreshRetryCooldown),
+        ]
+        return Dictionary(uniqueKeysWithValues: all.map { ($0.provider, $0) })
+    }()
     private var usageCacheLoaded = false
     private static let usageCacheKey = "usageCacheV1"
 
@@ -1153,7 +1153,7 @@ final class AppState: ObservableObject {
                 pendingSwitchID = id
                 Task { @MainActor in
                     defer { pendingSwitchID = nil }
-                    await quiesceGaugeTask(for: .codex)
+                    await quiesceGaugeTask(for: provider)
                     performSwitch(to: id)
                 }
             } else {

@@ -25,13 +25,18 @@ final class InactiveGaugeRefresherTests: XCTestCase {
     final class FakeStore: GaugeSecretStore, @unchecked Sendable {
         var secrets: [UUID: Data] = [:]
         var writes: [(UUID, Data)] = []
+        /// 쓰기 실패 주입 (디스크 풀 등) — capture-or-nothing 계약 검증용.
+        var failWrites = false
         /// 락 진입 시점에 호출 — "HTTP 왕복 중 스냅샷이 바뀌는" 상황을 주입한다.
         /// 자기 자신을 인자로 넘겨, 훅이 스토어를 캡처해 참조 순환을 만들지 않게 한다.
         var onLockEnter: ((FakeStore) -> Void)?
 
         func secretData(for id: UUID) throws -> Data? { secrets[id] }
 
+        struct WriteFailed: Error {}
+
         func setSecretData(_ data: Data, for id: UUID) throws {
+            if failWrites { throw WriteFailed() }
             secrets[id] = data
             writes.append((id, data))
         }
@@ -76,8 +81,38 @@ final class InactiveGaugeRefresherTests: XCTestCase {
 
     /// @Sendable 스텁 클로저가 관찰값을 쓰기 위한 상자 — 지역 var 직접 변형(Swift 6 금지)을 피한다.
     final class Box<T>: @unchecked Sendable {
-        var value: T
-        init(_ value: T) { self.value = value }
+        private let lock = NSLock()
+        private var stored: T
+        var value: T {
+            get { lock.lock(); defer { lock.unlock() }; return stored }
+            set { lock.lock(); stored = newValue; lock.unlock() }
+        }
+        init(_ value: T) { self.stored = value }
+    }
+
+    /// 1회성 게이트 — 스텁이 특정 지점에 도달했음을 테스트에 알리고(open), 테스트가 열어줄 때까지
+    /// 스텁을 세워둔다(wait). 취소 타이밍을 sleep 없이 결정론적으로 고정하기 위한 것이다.
+    /// 스텁 본문은 nonisolated async 컨텍스트에서 돌므로 실제로 스레드 안전해야 한다.
+    final class Gate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var opened = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        func open() {
+            lock.lock()
+            opened = true
+            let pending = waiters
+            waiters = []
+            lock.unlock()
+            pending.forEach { $0.resume() }
+        }
+
+        func wait() async {
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                lock.lock()
+                if opened { lock.unlock(); c.resume() } else { waiters.append(c); lock.unlock() }
+            }
+        }
     }
 
     private func makeRefresher(store: FakeStore,
@@ -306,8 +341,26 @@ final class InactiveGaugeRefresherTests: XCTestCase {
                                                  activeID: { nil }, excludedID: { nil })
 
             XCTAssertTrue(updated.isEmpty)
-            XCTAssertTrue(store.writes.isEmpty)
+            XCTAssertEqual(counters.refreshCalls, 0, "만료 전이므로 회전 시도 자체가 없다")
         }
+    }
+
+    /// refresh는 성공해 회전본이 저장됐는데 그 직후 조회가 실패한 경우. 저장을 되돌리지 않고
+    /// 게이지만 마지막 값에 남는다 — 다음 라운드는 신선한 토큰으로 곧바로 조회한다.
+    func testProbeFailureAfterSuccessfulRefreshKeepsRotatedSnapshot() async {
+        let store = FakeStore(); store.secrets[id] = fresh
+        let counters = Counters()
+        let sut = makeRefresher(store: store, counters: counters, expired: true,
+                                refresh: { _ in .refreshed(rotatedSecret) },
+                                probe: { _ in .transient })
+
+        let updated = await sut.refreshRound(targets: [target], now: now,
+                                             activeID: { nil }, excludedID: { nil })
+
+        XCTAssertTrue(updated.isEmpty, "게이지는 마지막 값에 남는다")
+        XCTAssertEqual(store.secrets[id], rotatedSecret, "조회 실패가 저장된 회전본을 되돌리지 않는다")
+        XCTAssertNil(sut.lastRefreshAttempt(id), "refresh는 성공했으므로 쿨다운은 해제 상태")
+        XCTAssertNil(sut.deadBackoffUntil(id), "조회 실패는 죽은 토큰이 아니므로 백오프 없음")
     }
 
     // MARK: 여러 계정 — 하나가 실패해도 나머지는 계속 돈다
@@ -336,21 +389,26 @@ final class InactiveGaugeRefresherTests: XCTestCase {
 
     // MARK: onUsage — 라운드가 끝나기 전에 계정 단위로 즉시 반영된다
 
-    func testOnUsageFiresPerAccountDuringTheRound() async {
+    /// 순서만 보면 "라운드 끝에 모아서 두 번 호출"과 구분되지 않는다. 조회와 반영을 한 로그에
+    /// 섞어 적어, a의 게이지가 **b를 조회하기 전에** 반영됨을 고정한다.
+    func testOnUsageFiresBeforeTheNextAccountIsProbed() async {
         let a = UUID(), b = UUID()
         let store = FakeStore()
         store.secrets[a] = fresh; store.secrets[b] = fresh
         let counters = Counters()
+        let log = Box<[String]>([])
         let sut = makeRefresher(store: store, counters: counters, expired: false,
-                                probe: { _ in .usage(makeSnapshot(5)) })
+                                probe: { _ in log.value.append("probe"); return .usage(makeSnapshot(5)) })
 
         var order: [UUID] = []
         let updated = await sut.refreshRound(
             targets: [.init(id: a, emailAddress: email), .init(id: b, emailAddress: email)],
             now: now, activeID: { nil }, excludedID: { nil },
-            onUsage: { id, _ in order.append(id) })
+            onUsage: { id, _ in log.value.append("usage"); order.append(id) })
 
-        XCTAssertEqual(order, [a, b], "게이지가 계정 순서대로 하나씩 차오른다")
+        XCTAssertEqual(log.value, ["probe", "usage", "probe", "usage"],
+                       "반영이 다음 계정 조회 뒤로 밀리면 [probe, probe, usage, usage]가 된다")
+        XCTAssertEqual(order, [a, b], "계정 순서대로")
         XCTAssertEqual(updated.count, 2)
     }
 
@@ -367,5 +425,99 @@ final class InactiveGaugeRefresherTests: XCTestCase {
 
         XCTAssertTrue(updated.isEmpty)
         XCTAssertEqual(counters.refreshCalls, 0)
+    }
+
+    // MARK: 취소 — 쉴드는 회전을 완주시키고, 루프는 다음 계정으로 넘어가지 않는다
+
+    /// PR #7 리뷰의 차단 지적(회전 유실 brick 창)에 대응하는 불변식. 전환 진입의 quiesce가
+    /// 라운드를 취소해도 **진행 중인 refresh POST는 끊기지 않고 저장까지 완주**해야 한다.
+    /// 중간에 끊기면 서버는 회전을 커밋했는데 회전본은 유실돼 그 계정이 벽돌이 된다.
+    func testRefreshIsShieldedFromCancellationAndStillStoresRotated() async {
+        let store = FakeStore(); store.secrets[accountID] = freshSecret
+        let counters = Counters()
+        let entered = Gate(), mayReturn = Gate()
+        let cancelledInsideRefresh = Box(true)
+        let sut = makeRefresher(
+            store: store, counters: counters, expired: true,
+            refresh: { _ in
+                entered.open()                                  // 테스트에 "POST 발사됨" 알림
+                await mayReturn.wait()                          // 테스트가 취소를 걸 시간을 준다
+                cancelledInsideRefresh.value = Task.isCancelled  // 쉴드가 취소를 막았는가
+                return .refreshed(rotatedSecret)
+            },
+            probe: { _ in .usage(makeSnapshot(9)) })
+
+        let round = Task { @MainActor in
+            await sut.refreshRound(targets: [self.target], now: fixedNow,
+                                   activeID: { nil }, excludedID: { nil })
+        }
+        await entered.wait()
+        round.cancel()          // ← 전환 진입 시 quiesce가 하는 일
+        mayReturn.open()
+        let updated = await round.value
+
+        XCTAssertFalse(cancelledInsideRefresh.value,
+                       "쉴드 Task는 상위 취소를 상속하지 않아야 한다")
+        XCTAssertEqual(store.secrets[accountID], rotatedSecret,
+                       "취소가 회전본 저장을 막으면 그 계정은 벽돌이 된다")
+        XCTAssertEqual(updated[accountID]?.fiveHourPercent, 9)
+    }
+
+    /// 취소의 효력은 "다음 계정으로 진입하지 않는다"까지다 — 대기가 현재 계정의 진행 중 HTTP
+    /// 완료까지로 바운드된다는 quiesce 설계의 근거.
+    func testCancellationStopsBeforeEnteringTheNextAccount() async {
+        let first = UUID(), second = UUID()
+        let store = FakeStore()
+        store.secrets[first] = freshSecret
+        store.secrets[second] = freshSecret
+        let counters = Counters()
+        let entered = Gate(), mayReturn = Gate()
+        let sut = makeRefresher(
+            store: store, counters: counters, expired: false,
+            probe: { _ in
+                entered.open()
+                await mayReturn.wait()
+                return .usage(makeSnapshot(3))
+            })
+
+        let round = Task { @MainActor in
+            await sut.refreshRound(
+                targets: [.init(id: first, emailAddress: accountEmail),
+                          .init(id: second, emailAddress: accountEmail)],
+                now: fixedNow, activeID: { nil }, excludedID: { nil })
+        }
+        await entered.wait()    // 첫 계정 조회 진행 중
+        round.cancel()
+        mayReturn.open()
+        let updated = await round.value
+
+        XCTAssertEqual(counters.probedBytes.count, 1, "두 번째 계정에는 진입하지 않는다")
+        XCTAssertEqual(updated.count, 1, "첫 계정의 결과는 버리지 않는다")
+        XCTAssertNotNil(updated[first])
+        XCTAssertNil(updated[second])
+    }
+
+    // MARK: 저장 실패 — 성공으로 둔갑시키지 않는다 (brick 경로)
+
+    /// PR #7 리뷰의 두 번째 차단 지적. 회전본 쓰기가 실패했는데 성공으로 처리하면, 스냅샷에는
+    /// 이미 서버에서 소비된 구 refresh 토큰이 남은 채 쿨다운까지 풀려 그 계정이 벽돌이 된다.
+    /// `try?`로 되돌아가면 이 테스트가 죽는다.
+    func testStoreFailureIsNotTreatedAsSuccess() async {
+        let store = FakeStore()
+        store.secrets[id] = fresh
+        store.failWrites = true
+        let counters = Counters()
+        let sut = makeRefresher(store: store, counters: counters, expired: true,
+                                refresh: { _ in .refreshed(rotatedSecret) },
+                                probe: { _ in .usage(makeSnapshot(50)) })
+
+        let updated = await sut.refreshRound(targets: [target], now: now,
+                                             activeID: { nil }, excludedID: { nil })
+
+        XCTAssertTrue(updated.isEmpty, "저장 못 한 회전본으로 게이지를 갱신하면 안 된다")
+        XCTAssertTrue(counters.probedBytes.isEmpty, "저장 실패 시 이번 라운드는 그 계정을 건너뛴다")
+        XCTAssertEqual(store.secrets[id], fresh, "저장 스냅샷은 그대로")
+        XCTAssertEqual(sut.lastRefreshAttempt(id), now,
+                       "성공이 아니므로 재시도 쿨다운이 해제되면 안 된다")
     }
 }

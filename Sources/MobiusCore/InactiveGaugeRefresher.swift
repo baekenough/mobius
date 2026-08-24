@@ -62,10 +62,12 @@ extension AccountStore: GaugeSecretStore {}
 /// TOCTOU 재확인·capture-or-nothing 저장 같은 **자격증명 안전 불변식이 테스트 밖에** 있었고,
 /// 세 번째 프로바이더는 이 120여 줄을 통째로 복제해야 했다. 코어로 끌어내려 두 문제를 함께 푼다.
 ///
-/// `@MainActor`인 것은 의도다 — 이 루프는 원래 `AppState`(메인 액터)에서 돌았고, `AccountStore`의
-/// credential lock은 **동기** NSLock이라 `Switcher.switchTo`와 같은 액터에서 상호배제될 때만
-/// 의미가 있다. 실행 컨텍스트를 옮기면 그 락 순서 계약이 함께 바뀌므로 이 PR에서는 건드리지 않았다
-/// (스냅샷 읽기/쓰기는 계정당 수 KB로, 기존과 동일한 비용이다).
+/// `@MainActor`는 **기존 실행 컨텍스트를 그대로 보존한 것**이다 — 이 루프는 `AppState`(메인 액터)
+/// 안에 있었고, 호출측이 활성 계정 판정을 동기 클로저로 넘긴다. 스냅샷 읽기/쓰기가 메인 스레드에서
+/// 도는 것도 기존과 같다(계정당 수 KB). 다른 컨텍스트로 옮기는 것은 `activeID` 조회의 동기 계약부터
+/// 바꿔야 하는 별개 변경이라 이 PR에서는 하지 않았다.
+/// (`AccountStore`의 credential lock은 NSLock이라 어느 스레드에서 쥐어도 상호배제된다 — 액터 선택과
+/// 무관하다. 여기서 @MainActor를 고른 이유는 락이 아니라 위의 호출 계약이다.)
 ///
 /// 대상은 **비활성 계정만**이다 — 활성 계정을 refresh하면 실행 중인 CLI 세션이 메모리에 든
 /// 시작 시점 토큰이 서버 회전으로 무효화된다(클로버 → 세션 파괴). 호출측이 활성/전환중 계정을
@@ -96,10 +98,18 @@ public final class InactiveGaugeRefresher {
 
     public var provider: Provider { adapter.provider }
 
+    /// refresh 토큰이 폐기된(죽은) 계정의 긴 백오프 — 어차피 401이므로 이 시각 전까지
+    /// refresh/probe를 아예 건너뛴다. 게이지 전용 상수라 이 컴포넌트가 단일 출처다.
+    /// `nonisolated` — 기본 인자 표현식은 비격리 문맥에서 평가된다(Swift 6에서는 오류).
+    nonisolated public static let defaultDeadRefreshCooldown: TimeInterval = 24 * 3600
+
+    /// - Parameters:
+    ///   - retryCooldown: transient 실패 후 계정당 재시도 간격. 호출측(AppState)이 Claude 경로와
+    ///     같은 값을 쓰므로 주입받는다.
     public init(adapter: any InactiveGaugeProvider,
                 store: any GaugeSecretStore,
                 retryCooldown: TimeInterval,
-                deadRefreshCooldown: TimeInterval) {
+                deadRefreshCooldown: TimeInterval = InactiveGaugeRefresher.defaultDeadRefreshCooldown) {
         self.adapter = adapter
         self.store = store
         self.retryCooldown = retryCooldown
@@ -149,7 +159,15 @@ public final class InactiveGaugeRefresher {
                     //   전환으로 활성이 됐으면 라이브 자격증명이 authoritative이므로 회전본을
                     //   버린다), (2) 스냅샷 재확인(HTTP 왕복 중 adopt/재로그인이 끼면 신규 로그인
                     //   스냅샷을 구 세션 회전본으로 덮는 edge 차단), (3) 신원/형태 검증, (4) 원자
-                    //   저장. 하나라도 어긋나면 기존 스냅샷을 **보존**한다(덮어쓰지 않음).
+                    //   저장. 하나라도 어긋나면 저장 스냅샷을 **덮어쓰지 않는다**.
+                    //   ★ 단, "덮어쓰지 않음"이 곧 무해는 아니다 — 200을 받은 시점에 서버측 회전은
+                    //     이미 커밋돼 구 refresh 토큰이 소비된 상태다. 회전본을 버리면 스냅샷에는
+                    //     소비된 토큰이 남아 다음 라운드가 .invalidated를 받고 24시간 백오프로 들어간다
+                    //     (게이지만 얼고, 게이지 전용 방화벽이라 아무것도 마킹하지 않는다). 그래서 이
+                    //     경로에 도달하는 빈도 자체를 호출측이 줄인다 — 전환 진입 시 quiesce, 매 계정
+                    //     활성 fresh-read, 그리고 refresh POST의 취소 쉴드.
+                    //     저장 실패(4번)도 같은 결과가 되며, 게이지 경로에는 Claude의 .storeFailed →
+                    //     needsReauth 같은 복구 표면이 없다(마킹 금지가 이 컴포넌트의 계약이다).
                     let stored: Data? = store.withCredentialLock(id) { () -> Data? in
                         guard id != activeID() else { return nil }
                         guard let current = try? store.secretData(for: id), current == secret
