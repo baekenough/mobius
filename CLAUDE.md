@@ -33,6 +33,10 @@ Sources/MobiusCore/       앱·CLI 공유 코어 (전부 의존성 주입 → �
   RateLimitParser.swift    Claude 세션 로그 rate-limit 이벤트 파서 (실측 기반)
   CodexRateLimitParser.swift Codex rate_limits 상태 파서 (매 턴 in-band, 게이지+소진 판정)
   CodexStatusRouter.swift  Codex 상태의 계정 귀속 — 전환 전 세션 파일 격리 (오염 방지 ★아래)
+  InactiveGaugeRefresher.swift 비활성 계정 게이지 갱신 공용 루프 — 만료 판정 → refresh →
+                           credential lock 안 원자 검증 저장 → usage 조회. 프로바이더별 능력은
+                           InactiveGaugeProvider 어댑터로 주입 (게이지 전용: 아무것도 마킹 안 함)
+  CodexGaugeAdapter.swift  Codex용 InactiveGaugeProvider 조립 (AuthBlob+TokenRefresher+UsageProber)
   SessionLogWatcher.swift  세션 로그 tail — (루트, 파서, 정책) 주입 제네릭 (네트워크 0)
   AutoSwitchEngine.swift   순수 상태머신, 풀당 1인스턴스 (쿨다운/마진/autoSwitchedFromPrimary,
                            on/off는 풀별 autoSwitchByProvider — 기록 없는 풀은 켬; 모델스코프 pin)

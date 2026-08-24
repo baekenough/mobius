@@ -21,18 +21,19 @@ final class AppState: ObservableObject {
     // 백그라운드에서. 완료되면 nil로 정착(실제 activeAccountID가 인계).
     @Published private(set) var pendingSwitchID: UUID?
     private var usageTask: Task<Void, Never>?
-    // 비활성 codex 게이지 프로브 — 단일 플라이트 핸들 + 순수 조회기. 게이지 전용(마킹 없음).
-    private var codexUsageTask: Task<Void, Never>?
-    private let codexProber = CodexUsageProber()
-    // 비활성 codex 계정의 만료 access 토큰 refresh(게이지 전용) — 회전본은 credential lock 안에서
-    // 활성 재확인·신원 검증 후 원자 저장한다. 활성 계정은 절대 refresh하지 않는다.
-    private let codexRefresher = CodexTokenRefresher()
-    // transient(네트워크/5xx) 실패 시 팝오버마다 회전 시도가 반복되지 않게 하는 계정당 재시도 쿨다운.
-    private var lastCodexRefreshAttemptAt: [UUID: Date] = [:]
-    // refresh_token_invalidated/invalid_grant(죽은 토큰) 계정의 긴 백오프 — 죽은 토큰은 어차피 401
-    // 이므로 이 시각 전까지 refresh/probe를 아예 건너뛴다(게이지는 마지막 값에 둔다).
-    private var codexRefreshDeadUntil: [UUID: Date] = [:]
-    static let codexDeadRefreshCooldown: TimeInterval = 24 * 3600
+    // 비활성 계정 게이지 갱신 — 프로바이더당 단일 플라이트 Task + 코어의 공용 루프
+    // (InactiveGaugeRefresher: 만료 판정 → refresh → 원자 검증 저장 → probe). 게이지 전용
+    // (마킹 없음)이며, 프로바이더가 늘어나도 어댑터 하나와 아래 항목 한 줄만 추가하면 된다.
+    private var gaugeTasks: [Provider: Task<Void, Never>] = [:]
+    private lazy var gaugeRefreshers: [Provider: InactiveGaugeRefresher] = [
+        .codex: InactiveGaugeRefresher(adapter: CodexGaugeAdapter(io: codexIO),
+                                       store: store,
+                                       retryCooldown: Self.usageRefreshRetryCooldown,
+                                       deadRefreshCooldown: Self.deadGaugeRefreshCooldown),
+    ]
+    // refresh 토큰이 폐기된(죽은) 계정의 긴 백오프 — 어차피 401이므로 이 시각 전까지
+    // refresh/probe를 아예 건너뛴다(게이지는 마지막 값에 둔다).
+    static let deadGaugeRefreshCooldown: TimeInterval = 24 * 3600
     private var usageCacheLoaded = false
     private static let usageCacheKey = "usageCacheV1"
 
@@ -421,106 +422,55 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// codex 전환 직전, 진행 중인 비활성 게이지 refresh를 정지·완료대기시킨다 — 전환↔회전 HTTP
-    /// 창(케이스2: 왕복 중 전환)을 닫는다. cancel()은 루프의 다음 계정 진입을 막아, 대기를 현재 처리
-    /// 중인 계정의 진행 중 HTTP(refresh 후 probe까지 최대 2회 순차) 완료까지로 바운드한다.
-    private func quiesceCodexUsageTask() async {
-        codexUsageTask?.cancel()
-        await codexUsageTask?.value
+    /// 전환 직전, 그 프로바이더의 진행 중인 비활성 게이지 refresh를 정지·완료대기시킨다 —
+    /// 전환↔회전 HTTP 창(케이스2: 왕복 중 전환)을 닫는다. cancel()은 루프의 다음 계정 진입을 막아,
+    /// 대기를 현재 처리 중인 계정의 진행 중 HTTP(refresh 후 probe까지 최대 2회 순차) 완료까지로
+    /// 바운드한다.
+    private func quiesceGaugeTask(for provider: Provider) async {
+        gaugeTasks[provider]?.cancel()
+        await gaugeTasks[provider]?.value
     }
 
-    /// 팝오버가 열릴 때 호출 — **비활성 codex** 계정의 게이지를 네트워크로 조회한다(Claude의
-    /// refreshUsageIfStale와 대칭). 활성 codex 계정은 세션 로그 in-band 경로(tick의
+    /// 팝오버가 열릴 때 호출 — 비활성 codex 계정 게이지 갱신(뷰가 부르는 이름 유지).
+    func refreshCodexUsageIfStale() { refreshInactiveGauges(for: .codex) }
+
+    /// 팝오버가 열릴 때 호출 — **비활성** 계정의 게이지를 네트워크로 조회한다(Claude의
+    /// refreshUsageIfStale와 대칭). 활성 계정은 프로바이더별 in-band 경로(codex는 tick의
     /// processCodexBatches)가 그대로 담당하므로 제외한다 — processCodexBatches는 손대지 않는다.
     ///
     /// ★ **게이지 전용**: usage 캐시(usage[id])만 채운다. setNeedsReauth·엔진·rateLimit 기록을
-    /// 절대 호출하지 않고(CodexUsageProber의 안전 계약), 자격증명은 저장 스냅샷 바이트를 읽기
-    /// 전용으로만 쓴다(쓰기/refresh/codex 실행 없음). 401은 만료된 비활성 토큰이라 무해하게
-    /// 게이지를 stale로 둔다. wham/usage는 codex가 이미 폴링하는 상태 엔드포인트라 추가 쿼터
-    /// 부담이 없어(B1), showUsageGauges와 함께 기본 활성이다(별도 토글 없음 — Claude와 대칭).
+    /// 절대 호출하지 않고(InactiveGaugeProvider의 안전 계약), 자격증명은 저장 스냅샷 바이트를
+    /// 읽기 전용으로만 쓴다(만료 시 게이지를 되살리는 refresh만 예외이며, 회전본은 credential
+    /// lock 안에서 활성 재확인·신원 검증 후에만 저장된다). 401은 만료된 비활성 토큰이라 무해하게
+    /// 게이지를 stale로 둔다. codex의 wham/usage는 codex가 이미 폴링하는 상태 엔드포인트라 추가
+    /// 쿼터 부담이 없어(B1), showUsageGauges와 함께 기본 활성이다(별도 토글 없음 — Claude와 대칭).
     /// 신선도/쿨다운 기준은 usage[id].fetchedAt(영속됨) — 재시작 후에도 엔드포인트를 난타하지 않는다.
-    func refreshCodexUsageIfStale() {
+    private func refreshInactiveGauges(for provider: Provider) {
         loadUsageCacheIfNeeded()
         guard UserDefaults.standard.object(forKey: "showUsageGauges") == nil
                 || UserDefaults.standard.bool(forKey: "showUsageGauges") else { return }
-        guard codexUsageTask == nil else { return }
+        guard let refresher = gaugeRefreshers[provider] else { return }
+        guard gaugeTasks[provider] == nil else { return }
         let now = Date()
-        let codexActiveID = store.file.activeByProvider[.codex]
-        // 비활성 codex 계정 중 게이지 캐시가 만료된 것만. 활성은 로그 경로가 담당하므로 제외.
-        let stale = store.file.accounts.filter {
-            $0.provider == .codex && $0.id != codexActiveID &&
-            (usage[$0.id]?.fetchedAt ?? .distantPast) < now.addingTimeInterval(-usageStaleness)
-        }
-        guard !stale.isEmpty else { return }
-        codexUsageTask = Task { @MainActor in
-            defer { codexUsageTask = nil }
-            var updated = false
-            for profile in stale {
-                if Task.isCancelled { break }
-                // 죽은 토큰 계정은 긴 백오프 동안 refresh/probe를 아예 건너뛴다(어차피 401 → 무의미).
-                if let deadUntil = codexRefreshDeadUntil[profile.id], now < deadUntil { continue }
-                // 저장된 auth.json 스냅샷 바이트를 읽는다. refresh 성공 시 아래에서 회전본으로 교체.
-                guard let authJSON = try? store.secretData(for: profile.id) else { continue }
-                var probeBytes = authJSON
-
-                // 저장 access 토큰이 이미 만료됐으면 게이지를 못 읽어 얼어붙는다(GET엔 회전이 없어
-                // 만료 토큰으로 조회하면 401만 받는다) → refresh로 미리 되살린다. **활성 계정은 절대
-                // refresh하지 않는다**(락 밖 fresh-read로 활성/전환중 계정을 재확인).
-                let liveActiveID = store.file.activeByProvider[.codex]
-                if profile.id != liveActiveID, profile.id != pendingSwitchID,
-                   let exp = CodexAuthBlob.accessTokenExpiry(fromAuthJSON: authJSON), exp <= now {
-                    // 계정당 쿨다운: 최근 시도가 있으면 이번 라운드는 건너뛴다(만료 토큰이라 게이지도
-                    // 어차피 못 읽는다). 첫 시도는 게이팅 안 됨(distantPast)이라 프리즈 해소는 유지.
-                    guard now.timeIntervalSince(lastCodexRefreshAttemptAt[profile.id] ?? .distantPast)
-                            >= Self.usageRefreshRetryCooldown else { continue }
-                    lastCodexRefreshAttemptAt[profile.id] = now
-                    let refreshOutcome = await Task { await codexRefresher.refresh(authJSON: authJSON) }.value
-                    switch refreshOutcome {
-                    case .refreshed(let rotated):
-                        // ★ 원자 capture: credential lock 안에서 (1) 활성 재확인(TOCTOU — 그 사이
-                        //   자동/수동 전환으로 활성이 됐으면 라이브 ~/.codex가 authoritative이므로
-                        //   회전본을 버린다), (2) 신원/형태 검증(실패 기록 1/13 클래스: 손상·타 계정
-                        //   바이트가 스냅샷을 덮어쓰지 않게), (3) 원자 저장. 하나라도 어긋나면 기존
-                        //   스냅샷을 보존한다(덮어쓰지 않음).
-                        let stored: Data? = store.withCredentialLock(profile.id) { () -> Data? in
-                            guard profile.id != store.file.activeByProvider[.codex] else { return nil }
-                            // 락 안에서 스냅샷을 다시 읽는다 — HTTP 왕복 중 adopt/재로그인이 끼면
-                            // 신규 로그인 스냅샷을 구 세션 회전본으로 덮는 edge를 차단(회전본 폐기).
-                            guard let current = try? store.secretData(for: profile.id),
-                                  current == authJSON else { return nil }
-                            guard codexIO.recognizesSecret(rotated),
-                                  CodexConfigIO.email(fromAuthJSON: rotated) == profile.emailAddress,
-                                  CodexTokenRefresher.refreshToken(fromAuthJSON: rotated)?.isEmpty == false
-                            else { return nil }
-                            do { try store.setSecretData(rotated, for: profile.id) } catch { return nil }
-                            return rotated
-                        }
-                        guard let stored else { continue }   // 활성이 됨 / 검증 실패 — 이번 라운드 스킵
-                        probeBytes = stored
-                        lastCodexRefreshAttemptAt[profile.id] = nil   // 성공 — 쿨다운 해제
-                        codexRefreshDeadUntil[profile.id] = nil
-                    case .invalidated:
-                        // 죽은 refresh 토큰(세션 종료) — 게이지 전용 방화벽: 엔진/persisted reauth를
-                        // 절대 건드리지 않고, 긴 백오프(codexRefreshDeadUntil)만 남기고 stale로 둔다.
-                        codexRefreshDeadUntil[profile.id] = now.addingTimeInterval(Self.codexDeadRefreshCooldown)
-                        continue
-                    case .transient:
-                        // refresh POST는 위 Task {} 쉴드로 취소 비전파라 여기는 순수 네트워크/5xx다
-                        // (우리 자신의 취소로 인한 transient는 이 분기에 도달할 수 없다).
-                        continue   // 쿨다운 뒤 재시도(게이지는 마지막 값 유지)
-                    }
-                }
-
-                // B1 게이지 조회 — (가능하면 갱신된) 바이트로. 읽기 전용, 아무것도 마킹하지 않는다.
-                switch await codexProber.probe(authJSON: probeBytes, now: now) {
-                case .usage(let snap):
-                    usage[profile.id] = snap
-                    updated = true
-                case .stale, .transient:
-                    continue   // 게이지를 마지막 스냅샷에 둔다 — 아무것도 마킹하지 않는다.
-                }
+        let activeID = store.file.activeByProvider[provider]
+        // 비활성 계정 중 게이지 캐시가 만료된 것만. 활성은 in-band 경로가 담당하므로 제외.
+        let targets = store.file.accounts
+            .filter {
+                $0.provider == provider && $0.id != activeID &&
+                (usage[$0.id]?.fetchedAt ?? .distantPast) < now.addingTimeInterval(-usageStaleness)
             }
-            if updated { saveUsageCache() }
+            .map { InactiveGaugeRefresher.Target(id: $0.id, emailAddress: $0.emailAddress) }
+        guard !targets.isEmpty else { return }
+        gaugeTasks[provider] = Task { @MainActor in
+            defer { gaugeTasks[provider] = nil }
+            let updated = await refresher.refreshRound(
+                targets: targets,
+                now: now,
+                // ★ 매 계정마다 새로 읽는다 — 루프가 도는 사이 자동/수동 전환으로 활성이 바뀔 수 있다.
+                activeID: { self.store.file.activeByProvider[provider] },
+                excludedID: { self.pendingSwitchID },
+                onUsage: { id, snap in self.usage[id] = snap })
+            if !updated.isEmpty { saveUsageCache() }
         }
     }
 
@@ -1140,7 +1090,7 @@ final class AppState: ObservableObject {
                 guard await preflightFallback(id, now: now) else { file = store.file; return }
             }
             let fromID = store.file.activeByProvider[provider]
-            if provider == .codex { await quiesceCodexUsageTask() }
+            if provider == .codex { await quiesceGaugeTask(for: provider) }
             do {
                 try switcher.switchTo(id)
                 engines[provider]?.noteSwitched(now: now)
@@ -1203,7 +1153,7 @@ final class AppState: ObservableObject {
                 pendingSwitchID = id
                 Task { @MainActor in
                     defer { pendingSwitchID = nil }
-                    await quiesceCodexUsageTask()
+                    await quiesceGaugeTask(for: .codex)
                     performSwitch(to: id)
                 }
             } else {
