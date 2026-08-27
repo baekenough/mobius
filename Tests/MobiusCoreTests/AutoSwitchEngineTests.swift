@@ -68,7 +68,9 @@ final class AutoSwitchEngineTests: XCTestCase {
         file.accounts[0].userPinned = false
         XCTAssertEqual(
             AutoSwitchEngine().onRateLimitHit(file: file, hit: RateLimitHit(resetsAt: nil, modelScoped: true), now: t0),
-            .switchTo(fb1.id, reason: .activeExhausted))
+            // 사유가 .activeExhausted가 아니라 .modelExhausted다 — 알림 문구가 갈린다
+            // (계정은 다른 모델로 계속 쓸 수 있으므로 "한도 소진"이라고 하면 거짓말).
+            .switchTo(fb1.id, reason: .modelExhausted))
     }
 
     func testAccountWideLimitSwitchesEvenPinned() {
@@ -85,7 +87,7 @@ final class AutoSwitchEngineTests: XCTestCase {
         let engine = AutoSwitchEngine()
         engine.noteSwitched(now: t0)                      // 방금 전환됨
         XCTAssertEqual(engine.onTick(file: file, now: t0.addingTimeInterval(30)), .none) // 쿨다운
-        XCTAssertEqual(engine.onTick(file: file, now: t0.addingTimeInterval(121)),
+        XCTAssertEqual(engine.onTick(file: file, now: t0.addingTimeInterval(engine.cooldown + 1)),
                        .switchTo(fb1.id, reason: .activeExhausted)) // 쿨다운 후
     }
 
@@ -139,7 +141,9 @@ final class AutoSwitchEngineTests: XCTestCase {
         // 리셋 직후(margin 60초 전): 아직
         XCTAssertEqual(engine.onTick(file: file, now: t0.addingTimeInterval(110)), .none)
         // 리셋 + margin 후: 복귀
-        XCTAssertEqual(engine.onTick(file: file, now: t0.addingTimeInterval(161)),
+        // 쿨다운이 아니라 **margin** 테스트다(noteSwitched를 안 부르므로 쿨다운은 게이트가
+        // 아니다) — 쿨다운 상수에 묶으면 그 값을 바꿀 때 엉뚱하게 빨간불이 된다(셀프리뷰 L1).
+        XCTAssertEqual(engine.onTick(file: file, now: t0.addingTimeInterval(100 + engine.margin + 1)),
                        .switchTo(primary.id, reason: .primaryRecovered))
     }
 
@@ -148,12 +152,12 @@ final class AutoSwitchEngineTests: XCTestCase {
         _ = engine.onRateLimitHit(file: file,
                                   hit: RateLimitHit(resetsAt: t0.addingTimeInterval(3600)), now: t0)
         engine.noteSwitched(now: t0) // 호출자가 실제 전환 후 알려줌
-        // 쿨다운(120초) 내 primary 회복 틱 → 억제
+        // 쿨다운 내 primary 회복 틱 → 억제
         file.activeAccountID = fb1.id
         file.autoSwitchedFromPrimary = true
         file.accounts[0].rateLimit = nil
         XCTAssertEqual(engine.onTick(file: file, now: t0.addingTimeInterval(60)), .none)
-        XCTAssertEqual(engine.onTick(file: file, now: t0.addingTimeInterval(121)),
+        XCTAssertEqual(engine.onTick(file: file, now: t0.addingTimeInterval(engine.cooldown + 1)),
                        .switchTo(primary.id, reason: .primaryRecovered))
     }
 
@@ -168,14 +172,14 @@ final class AutoSwitchEngineTests: XCTestCase {
         // 호출자가 전환을 반영: primary 한도 기록, fb1 활성
         file.accounts[0].rateLimit = RateLimitInfo(resetsAt: t0.addingTimeInterval(3600), recordedAt: t0)
         file.activeAccountID = fb1.id
-        // 쿨다운(120초) 내 hit → 억제
+        // 쿨다운 내 hit → 억제
         XCTAssertEqual(engine.onRateLimitHit(file: file, hit: hit, now: t0.addingTimeInterval(60)),
                        .none)
         // 경계 정각(t0 + cooldown): now < last + cooldown 이 거짓 → 허용
-        XCTAssertEqual(engine.onRateLimitHit(file: file, hit: hit, now: t0.addingTimeInterval(120)),
+        XCTAssertEqual(engine.onRateLimitHit(file: file, hit: hit, now: t0.addingTimeInterval(engine.cooldown)),
                        .switchTo(fb2.id, reason: .activeExhausted))
         // 쿨다운 경과 후 같은 hit → 전환
-        XCTAssertEqual(engine.onRateLimitHit(file: file, hit: hit, now: t0.addingTimeInterval(121)),
+        XCTAssertEqual(engine.onRateLimitHit(file: file, hit: hit, now: t0.addingTimeInterval(engine.cooldown + 1)),
                        .switchTo(fb2.id, reason: .activeExhausted))
     }
 
@@ -352,7 +356,7 @@ final class AutoSwitchEngineTests: XCTestCase {
         XCTAssertEqual(engine.checkAdvisory(file: f, activeID: primary.id,
                                             verifiedCandidate: fb2.id,
                                             alreadyAdvised: false,
-                                            now: t0.addingTimeInterval(121)),
+                                            now: t0.addingTimeInterval(engine.cooldown + 1)),
                        .switchTo(fb2.id, reason: .thresholdAdvisory))
 
         // 반대 방향: 임계값 전환 직후 → 소진 hit도 쿨다운에 막힌다
@@ -415,7 +419,7 @@ final class AutoSwitchEngineTests: XCTestCase {
 
     func testRecoveryGateBlocksOnAdvisoryOnlyDeparture() {
         // advisory만 보고 떠난 경우 primary에는 rateLimit이 없다 — 예전 가드는 이때 통째로
-        // 스킵돼 쿨다운(120초)만 지나면 복귀 → 2분 주기 핑퐁이 났다.
+        // 스킵돼 쿨다운만 지나면 복귀 → 2분 주기 핑퐁이 났다.
         file.activeAccountID = fb1.id
         file.autoSwitchedFromPrimary = true
         file.accounts[0].advisory = AdvisoryRecord(utilization: 95,
@@ -450,7 +454,134 @@ final class AutoSwitchEngineTests: XCTestCase {
         file.accounts[0].advisory = nil
         let engine = AutoSwitchEngine()
         XCTAssertEqual(engine.onTick(file: file, now: t0.addingTimeInterval(110)), .none)
-        XCTAssertEqual(engine.onTick(file: file, now: t0.addingTimeInterval(161)),
+        // 쿨다운이 아니라 **margin** 테스트다(noteSwitched를 안 부르므로 쿨다운은 게이트가
+        // 아니다) — 쿨다운 상수에 묶으면 그 값을 바꿀 때 엉뚱하게 빨간불이 된다(셀프리뷰 L1).
+        XCTAssertEqual(engine.onTick(file: file, now: t0.addingTimeInterval(100 + engine.margin + 1)),
                        .switchTo(primary.id, reason: .primaryRecovered))
+    }
+
+    // MARK: 모델 전용 한도와 계정 한도의 구분 (이슈 #19 후속)
+
+    /// ★ **모델 전용 한도가 걸린 폴백도 계정 소진 전환에서는 정상 후보다.**
+    /// Fable 주간 한도 하나(며칠짜리)가 폴백을 통째로 지우면, 주계정이 진짜로 소진됐을 때
+    /// 갈 곳이 없어 "모든 계정 한도 소진"이 뜬다 — 계정 자체는 멀쩡한데도. 이슈 #19의
+    /// 오귀인이 이 경로로 되살아났었다.
+    func testAccountExhaustionCanSwitchIntoModelLimitedFallback() {
+        file.accounts[1].rateLimit = RateLimitInfo(resetsAt: t0.addingTimeInterval(4 * 86400),
+                                                   recordedAt: t0, modelScoped: true)
+        let d = AutoSwitchEngine().onRateLimitHit(
+            file: file, hit: RateLimitHit(resetsAt: t0.addingTimeInterval(3600)), now: t0)
+        XCTAssertEqual(d, .switchTo(fb1.id, reason: .activeExhausted))
+    }
+
+    /// 반대로 **모델 한도 때문에 떠날 때**는 같은 모델이 막힌 계정을 건너뛴다 —
+    /// 옮겨봐야 그 모델은 여전히 못 쓴다.
+    func testModelLimitedSwitchSkipsModelLimitedFallback() {
+        file.accounts[1].rateLimit = RateLimitInfo(resetsAt: t0.addingTimeInterval(4 * 86400),
+                                                   recordedAt: t0, modelScoped: true)
+        let d = AutoSwitchEngine().onRateLimitHit(
+            file: file, hit: RateLimitHit(resetsAt: t0.addingTimeInterval(3600), modelScoped: true),
+            now: t0)
+        XCTAssertEqual(d, .switchTo(fb2.id, reason: .modelExhausted))
+    }
+
+    /// 모델 한도인데 갈 곳이 전부 같은 모델로 막혔으면 **"모든 계정 한도 소진"은 거짓말**이다
+    /// (계정들은 멀쩡하다). 조용히 머문다.
+    func testModelLimitedWithNoHeadroomStaysSilentInsteadOfAllExhausted() {
+        for i in 1...2 {
+            file.accounts[i].rateLimit = RateLimitInfo(resetsAt: t0.addingTimeInterval(4 * 86400),
+                                                       recordedAt: t0, modelScoped: true)
+        }
+        let d = AutoSwitchEngine().onRateLimitHit(
+            file: file, hit: RateLimitHit(resetsAt: t0.addingTimeInterval(3600), modelScoped: true),
+            now: t0)
+        XCTAssertEqual(d, .none)
+        // 계정 자체 소진이면 여전히 정직하게 allExhausted다.
+        for i in 1...2 {
+            file.accounts[i].rateLimit = RateLimitInfo(resetsAt: t0.addingTimeInterval(3600),
+                                                       recordedAt: t0, modelScoped: false)
+        }
+        XCTAssertEqual(AutoSwitchEngine().onRateLimitHit(
+            file: file, hit: RateLimitHit(resetsAt: t0.addingTimeInterval(3600)), now: t0),
+                       .allExhausted)
+    }
+
+    /// ★ **떠나는 이유가 모델 한도가 아니면** 모델 한도가 걸린 폴백을 걸러내면 안 된다.
+    /// 재인증이 필요한(= 못 쓰는) 계정에 머물러 있는데, 옛 Fable 기록이 남아 있다는 이유로
+    /// 갈 수 있는 폴백을 지워 버리면 사용자는 죽은 계정에 갇힌다.
+    func testReauthLeaveDoesNotFilterModelLimitedFallbacks() {
+        file.accounts[0].needsReauth = true
+        file.accounts[0].rateLimit = RateLimitInfo(resetsAt: t0.addingTimeInterval(4 * 86400),
+                                                   recordedAt: t0, modelScoped: true)
+        file.accounts[1].rateLimit = RateLimitInfo(resetsAt: t0.addingTimeInterval(4 * 86400),
+                                                   recordedAt: t0, modelScoped: true)
+        XCTAssertEqual(AutoSwitchEngine().onTick(file: file, now: t0),
+                       .switchTo(fb1.id, reason: .activeExhausted))
+    }
+
+    /// 계정 자체가 소진돼 떠날 때도 마찬가지 — 모델 한도 폴백은 정상 후보다.
+    func testAccountExhaustedLeaveDoesNotFilterModelLimitedFallbacks() {
+        file.accounts[0].rateLimit = RateLimitInfo(resetsAt: t0.addingTimeInterval(3600),
+                                                   recordedAt: t0, modelScoped: false)
+        file.accounts[1].rateLimit = RateLimitInfo(resetsAt: t0.addingTimeInterval(4 * 86400),
+                                                   recordedAt: t0, modelScoped: true)
+        XCTAssertEqual(AutoSwitchEngine().onTick(file: file, now: t0),
+                       .switchTo(fb1.id, reason: .activeExhausted))
+    }
+
+    /// 반대로 모델 한도**만** 걸려서 떠날 때는 같은 모델이 막힌 폴백을 건너뛴다.
+    func testModelLimitedLeaveSkipsModelLimitedFallbacksOnTick() {
+        file.accounts[0].rateLimit = RateLimitInfo(resetsAt: t0.addingTimeInterval(4 * 86400),
+                                                   recordedAt: t0, modelScoped: true)
+        file.accounts[1].rateLimit = RateLimitInfo(resetsAt: t0.addingTimeInterval(4 * 86400),
+                                                   recordedAt: t0, modelScoped: true)
+        XCTAssertEqual(AutoSwitchEngine().onTick(file: file, now: t0),
+                       .switchTo(fb2.id, reason: .modelExhausted))
+    }
+
+    /// ★ 자동 전환이 꺼진 풀에서 **모델 전용 한도**가 걸리면 "계정 한도 소진"이라고 알리면
+    /// 안 된다 — 그 계정은 다른 모델로 멀쩡히 쓸 수 있다(문구를 섞지 않는 이 저장소의 규칙).
+    func testAutoSwitchOffNotifiesModelLimitSeparately() {
+        file.autoSwitchByProvider[.claude] = false
+        XCTAssertEqual(AutoSwitchEngine().onRateLimitHit(
+            file: file, hit: RateLimitHit(resetsAt: t0.addingTimeInterval(3600), modelScoped: true),
+            now: t0),
+                       .notifyModelLimitedOnly(primary.id))
+        // 계정 자체 소진은 기존 문구 그대로.
+        XCTAssertEqual(AutoSwitchEngine().onRateLimitHit(
+            file: file, hit: RateLimitHit(resetsAt: t0.addingTimeInterval(3600)), now: t0),
+                       .notifyExhaustedOnly(primary.id))
+    }
+
+    /// 자동 전환이 꺼져 있어도 **핀은 존중**한다 — 핀 검사가 알림 분기보다 먼저여야 한다.
+    /// (사용자가 "여기 있겠다"고 고른 계정에 모델 한도 알림을 띄우지 않는다.)
+    func testPinnedModelLimitStaysSilentEvenWhenAutoSwitchOff() {
+        file.autoSwitchByProvider[.claude] = false
+        file.accounts[0].userPinned = true
+        XCTAssertEqual(AutoSwitchEngine().onRateLimitHit(
+            file: file, hit: RateLimitHit(resetsAt: t0.addingTimeInterval(3600), modelScoped: true),
+            now: t0),
+                       .none)
+    }
+
+    /// 모델 한도로 옮길 때의 전환 사유는 `.modelExhausted` — 알림 문구가 갈린다.
+    func testModelLimitedSwitchCarriesItsOwnReason() {
+        XCTAssertEqual(AutoSwitchEngine().onRateLimitHit(
+            file: file, hit: RateLimitHit(resetsAt: t0.addingTimeInterval(3600), modelScoped: true),
+            now: t0),
+                       .switchTo(fb1.id, reason: .modelExhausted))
+    }
+
+    /// ★ **쿨다운은 실측된 재시도 지연 상한을 덮어야 한다** (이슈 #19, @Phantomn 2026-08-22).
+    ///
+    /// 사고 로그에서 각 한도 에러의 "그 요청이 시작된 시각"까지 되짚으니 재시도 지연이
+    /// **63초 ~ 2분 7초(127초)** 였다. 예전 값 120초는 그 상한보다 짧아서, 전환 전에 시작된
+    /// 턴이 남긴 옛 계정 에러가 쿨다운이 풀린 뒤 도착해 새 활성 계정의 소진으로 오인됐다.
+    ///
+    /// 이 단언이 없으면 쿨다운을 다시 120초로 낮춰도 다른 테스트는 전부 초록이다
+    /// (경계 테스트들이 상수 기준 상대값이라 어떤 값이든 통과한다 — 실패 기록 18 계열).
+    func testCooldownCoversMeasuredRetryCeiling() {
+        let measuredRetryCeiling: TimeInterval = 127   // 2m07s, 실측 상한
+        XCTAssertGreaterThan(AutoSwitchEngine().cooldown, measuredRetryCeiling)
     }
 }

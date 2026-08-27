@@ -2,6 +2,7 @@ import Foundation
 
 public enum SwitchReason: Equatable, Sendable {
     case activeExhausted    // 활성 계정 한도 소진
+    case modelExhausted     // **모델 전용** 한도 소진 — 계정은 멀쩡하다(문구를 섞지 말 것)
     case primaryRecovered   // primary 리셋 도래 → 복귀
     case thresholdAdvisory  // 임계값 선제 경고 — **소진 아님** (알림 문구도 소진 표현 금지)
 }
@@ -11,6 +12,9 @@ public enum Decision: Equatable, Sendable {
     case switchTo(UUID, reason: SwitchReason)
     case allExhausted       // 전환할 곳이 없음 → 알림만
     case notifyExhaustedOnly(UUID) // 자동 전환 꺼짐 — 소진된 활성 계정 알림만
+    /// 자동 전환 꺼짐 — **모델 전용** 한도 알림만. notifyExhaustedOnly와 문구를 공유하면
+    /// "계정 한도 소진"이라고 거짓말하게 된다(계정은 다른 모델로 계속 쓸 수 있다).
+    case notifyModelLimitedOnly(UUID)
     /// 자동 전환 꺼짐 — 임계값 선제 경고 알림만. notifyExhaustedOnly와 **다른 케이스**다:
     /// 저쪽은 "이미 못 쓴다", 이쪽은 "아직 쓸 수 있는데 곧 찬다" — 문구가 섞이면 거짓말이 된다.
     case notifyAdvisoryOnly(UUID)
@@ -30,27 +34,60 @@ public enum CandidateProbeAction: Equatable, Sendable {
 /// 프로바이더 풀당 1인스턴스 — 쿨다운/복귀 판단이 풀별로 독립이다.
 public final class AutoSwitchEngine: @unchecked Sendable {
     public let provider: Provider
-    public var cooldown: TimeInterval = 120   // 전환 직후 재전환 금지
+    /// 전환 직후 재전환 금지 간격.
+    ///
+    /// ★ **실측 근거로 정한 값**(이슈 #19, @Phantomn 2026-08-22): 사고 로그에서 각 한도
+    ///   에러의 "그 요청이 시작된 시각"까지 되짚으니 **재시도 지연이 63초 ~ 2분 7초(127초)**
+    ///   였다. 즉 예전 값 120초는 **한 요청 분량도 못 덮어서**, 전환 전에 시작된 턴이 남긴
+    ///   옛 계정 에러가 쿨다운이 풀린 뒤 도착해 새 활성 계정의 소진으로 오인됐다.
+    ///   180초는 그 상한(127초)에 여유를 둔 값이고, 같은 사고를 다루는 다른 창들
+    ///   (`HitAttribution.modelScopeTrustWindow` 300초)보다는 짧게 유지한다 —
+    ///   이건 "전환 직후 연쇄 전환 금지"이지 귀속 판정 자체가 아니기 때문이다.
+    /// ※ 이 값은 더 이상 **유일한** 방어가 아니다: 귀속은 usage 검증이 판정한다
+    ///   (`HitAttribution`). 쿨다운은 그 위에 얹은 연쇄 전환 방지 장치다.
+    public var cooldown: TimeInterval = 180
     public var margin: TimeInterval = 60      // 리셋 시각 + margin 후에만 복귀
     private var lastSwitchAt: Date = .distantPast
     private let lock = NSLock()
 
     public init(provider: Provider = .claude) { self.provider = provider }
 
-    public func noteSwitched(now: Date = Date()) {
+    /// - Parameters:
+    ///   - forModelLimit: 이 전환이 **모델 전용 한도 때문**이었는가.
+    ///   - leftAccount: 그때 떠난 계정. primary 자동 복귀 게이트가 본다 — 아래 `onTick` (B).
+    ///
+    /// ★ 불리언 하나로 기억하면 안 된다(셀프리뷰 지적): 모델 한도로 A→B로 떠난 뒤 **다른
+    ///   이유의 전환**(임계값·계정 소진)이 한 번이라도 일어나면 플래그가 지워져, 아직 모델
+    ///   한도가 걸린 A로 복귀했다가 다음 틱에 곧바로 다시 떠나는 **왕복**(전환 2회 + 알림
+    ///   2회)이 그 창이 리셋될 때까지 반복된다. "어느 계정을 그 이유로 떠났는지"를 기억한다.
+    public func noteSwitched(now: Date = Date(), forModelLimit: Bool = false,
+                             leftAccount: UUID? = nil) {
         lock.lock(); defer { lock.unlock() }
         lastSwitchAt = now
+        if forModelLimit { modelLimitLeftAccount = leftAccount }
     }
+
+    /// 모델 전용 한도 때문에 떠난 계정(인메모리 — 재시작하면 nil로 시작한다. 그 경우 복귀가
+    /// 조금 더 관대해질 뿐이라 안전한 방향이다).
+    private var modelLimitLeftAccount: UUID?
 
     private func inCooldown(_ now: Date) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return now < lastSwitchAt.addingTimeInterval(cooldown)
     }
 
-    /// 후보: 풀 내 순서(우선순위)대로, 한도 안 걸렸고 재인증 불필요한 계정
-    private func firstAvailable(in file: AccountsFile, excluding: UUID?, now: Date) -> UUID? {
+    /// 후보: 풀 내 순서(우선순위)대로, 한도 안 걸렸고 재인증 불필요한 계정.
+    ///
+    /// - Parameter avoidModelLimited: **모델 전용 한도 때문에 떠나는 중인가.** 그렇다면
+    ///   같은 모델이 막힌 계정으로 옮겨봐야 소용없으므로 후보에서 뺀다. 반대로 계정 자체가
+    ///   소진돼 떠나는 경우엔 모델 한도가 걸린 계정도 **정상 후보다** — 계정은 멀쩡하고
+    ///   사용자는 다른 모델을 쓸 수 있다(이슈 #19 후속: 이걸 구분 안 하면 며칠짜리 모델
+    ///   한도 하나가 폴백을 통째로 지워 "모든 계정 한도 소진"이 난다).
+    private func firstAvailable(in file: AccountsFile, excluding: UUID?, now: Date,
+                                avoidModelLimited: Bool = false) -> UUID? {
         file.accounts(of: provider).first {
             $0.id != excluding && !$0.isLimited(now: now) && !$0.needsReauth
+                && !(avoidModelLimited && $0.isModelLimited(now: now))
         }?.id
     }
 
@@ -59,16 +96,26 @@ public final class AutoSwitchEngine: @unchecked Sendable {
     /// 새 활성 계정의 소진으로 오인해 연쇄 전환(B→C→D)되는 것을 막는다.
     public func onRateLimitHit(file: AccountsFile, hit: RateLimitHit, now: Date) -> Decision {
         guard let active = file.active(of: provider), !inCooldown(now) else { return .none }
-        // 이 풀의 자동 전환 꺼짐 — 스펙상 "끄면 소진 알림만": 전환 없이 알림 결정만 반환
-        guard file.isAutoSwitchEnabled(provider) else { return .notifyExhaustedOnly(active.id) }
         // 모델 전용 한도(Fable 등) + 사용자가 이 계정을 직접 고름(pin) → 전환하지 않고 머문다.
         // 계정은 다른 모델로 쓸 수 있고, 사용자가 "여기 있겠다"고 이미 선택했으므로.
+        // ★ 이 검사는 자동 전환 on/off보다 **먼저**다: 꺼져 있을 때도 핀은 존중해야 하고,
+        //   무엇보다 아래 알림 분기가 pin 케이스까지 삼키면 안 된다.
         if hit.modelScoped && active.userPinned { return .none }
-        guard let next = firstAvailable(in: markedFile(file, activeID: active.id, hit: hit, now: now),
-                                        excluding: active.id, now: now) else {
-            return .allExhausted
+        // 이 풀의 자동 전환 꺼짐 — 스펙상 "끄면 소진 알림만": 전환 없이 알림 결정만 반환.
+        // ★ 모델 전용 한도는 문구가 다르다 — "계정 한도 소진"이라고 하면 거짓말이다.
+        guard file.isAutoSwitchEnabled(provider) else {
+            return hit.modelScoped ? .notifyModelLimitedOnly(active.id)
+                                   : .notifyExhaustedOnly(active.id)
         }
-        return .switchTo(next, reason: .activeExhausted)
+        guard let next = firstAvailable(in: markedFile(file, activeID: active.id, hit: hit, now: now),
+                                        excluding: active.id, now: now,
+                                        avoidModelLimited: hit.modelScoped) else {
+            // ★ 모델 전용 한도인데 갈 곳이 없다 = 어디로 옮겨도 그 모델은 막혀 있다.
+            //   이때 "모든 계정 한도 소진"은 **거짓말이다** — 계정들은 멀쩡하고 다른 모델은
+            //   쓸 수 있다. 조용히 머문다(사용자는 CLI 에러로 이미 상황을 안다).
+            return hit.modelScoped ? .none : .allExhausted
+        }
+        return .switchTo(next, reason: hit.modelScoped ? .modelExhausted : .activeExhausted)
     }
 
     /// hit를 반영한 가상의 file (호출자는 별도로 store.update로 실제 반영한다)
@@ -94,9 +141,16 @@ public final class AutoSwitchEngine: @unchecked Sendable {
         //     (로그 hit 순간의 전환을 쿨다운·throw 등으로 놓쳐도 다음 틱에 복구).
         //     단 autoSwitchMayLeave가 false면(모델 전용 한도 + 사용자 핀) 밀어내지 않는다 —
         //     "1회 자동 전환 후 내가 되돌리면 머문다".
+        // ★ avoidModelLimited는 "모델 한도 기록이 있는가"가 아니라 **"그것 때문에 떠나는가"**다.
+        //   재인증 필요·계정 소진으로 떠나는데 옛 모델 한도 기록이 남아 있다는 이유로 후보를
+        //   걸러내면, 갈 수 있는 폴백이 있는데도 **못 쓰는 계정에 머문다**(셀프리뷰 지적).
+        let leavingForModelLimit = !active.needsReauth && !active.isLimited(now: now)
+            && active.isModelLimited(now: now)
         if active.autoSwitchMayLeave(now: now),
-           let next = firstAvailable(in: file, excluding: active.id, now: now) {
-            return .switchTo(next, reason: .activeExhausted)
+           let next = firstAvailable(in: file, excluding: active.id, now: now,
+                                     avoidModelLimited: leavingForModelLimit) {
+            return .switchTo(next, reason: leavingForModelLimit ? .modelExhausted
+                                                                : .activeExhausted)
         }
 
         // (B) primary 복귀 — 현재 fallback 활성이 "자동 전환"의 결과일 때만
@@ -109,7 +163,15 @@ public final class AutoSwitchEngine: @unchecked Sendable {
         //   검사해서, advisory만 보고 떠난 경우(rateLimit 없음) 가드가 통째로 스킵됐다 →
         //   쿨다운(120초)이 풀리는 순간 primary로 돌아가고, 아직 임계값 위인 primary를
         //   다시 떠나는 2분 주기 핑퐁이 창이 리셋될 때까지 계속된다.
-        let gates = [primary.rateLimit?.resetsAt, primary.advisory?.resetsAt]
+        // ★ primary의 **모델 전용 한도**는 "떠난 이유가 그것이었을 때만" 복귀를 막는다
+        //   (셀프리뷰 지적). 모델 한도는 며칠 가는데, 그걸 무조건 게이트로 쓰면 계정 자체가
+        //   멀쩡한 primary로 **일주일 내내 못 돌아온다** — 게다가 (A)의 firstAvailable은
+        //   같은 상태의 계정을 다른 이유의 전환에서는 정상 후보로 고르므로 두 분기가 서로
+        //   모순된 말을 하게 된다. 계정 자체 한도는 이유와 무관하게 늘 게이트다.
+        let modelGate = lock.withLock { modelLimitLeftAccount } == primary.id
+            ? primary.rateLimit.flatMap { $0.modelScoped ? $0.resetsAt : nil } : nil
+        let accountGate = primary.rateLimit.flatMap { $0.modelScoped ? nil : $0.resetsAt }
+        let gates = [accountGate, modelGate, primary.advisory?.resetsAt]
             .compactMap { $0?.addingTimeInterval(margin) }
         if let blockedUntil = gates.max(), now < blockedUntil { return .none }
         return .switchTo(primary.id, reason: .primaryRecovered)

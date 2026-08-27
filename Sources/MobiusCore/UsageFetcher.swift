@@ -47,6 +47,49 @@ public struct UsageSnapshot: Codable, Equatable, Sendable {
         guard let resetsAt = exhaustedResets.max() else { return nil }
         return RateLimitHit(resetsAt: resetsAt)
     }
+
+    /// **모델 전용** 주간 한도(`limits[].weekly_scoped`, 예: Fable)의 소진 판정.
+    /// 계정 창(5시간/주간)과 **의도적으로 분리**돼 있다 — 계정 자체는 여유인데 특정 모델만
+    /// 막힌 상태이므로 `modelScoped: true`로 표시하고, 소비자는 이를 "계정 사용 불가"가
+    /// 아니라 "그 모델만 불가"로 다룬다(`AccountProfile.isModelLimited`).
+    /// `exhaustionHit`과 같은 규칙으로 **아직 안 지난 리셋 시각**만 인정하고, 그중 가장 늦은 것.
+    public func scopedExhaustionHit(now: Date) -> RateLimitHit? {
+        let resets = (scopedLimits ?? [])
+            .filter { $0.percent >= 100 }
+            .compactMap(\.resetsAt)
+            .filter { $0 > now }
+        guard let resetsAt = resets.max() else { return nil }
+        return RateLimitHit(resetsAt: resetsAt, kind: .window, modelScoped: true)
+    }
+
+    /// 모델 전용 한도가 100%인데 **쓸 수 있는 리셋 시각이 없는가**(누락/이미 지남).
+    ///
+    /// ★ 실측 근거(이슈 #19, @Phantomn 2026-08-16): 라이브 응답의 `weekly_scoped` 항목은
+    ///   `resets_at: null`로 온다 — 그 계정은 `percent: 0`이었지만 **필드 자체가 옵셔널**임이
+    ///   확인됐다. 그러면 `scopedExhaustionHit`의 `compactMap(\.resetsAt)`이 조용히 떨어뜨려
+    ///   "여유 있음"과 구분되지 않는다(= 100%로 막힌 사용자의 hit이 버려지고 백오프까지 걸린다).
+    ///   계정 창에 `hasExhaustedAccountWindow`로 만들어 둔 `.inconclusive` 구분을 여기에도 둔다.
+    public func hasUnresolvableScopedLimit(now: Date) -> Bool {
+        (scopedLimits ?? []).contains { limit in
+            guard limit.percent >= 100 else { return false }
+            guard let reset = limit.resetsAt else { return true }   // 시각 없음
+            return reset <= now                                      // 이미 지남
+        }
+    }
+
+    /// **계정 창**(5시간/주간) 중 100%인 것이 있는가(리셋 시각의 유효성과 무관).
+    /// `.inconclusive` 판정용 — "여유 있음"과 "소진인데 리셋 시각을 못 얻음"을 가른다.
+    /// ★ 모델 전용 한도는 **일부러 제외한다**: 며칠 100%로 남아 있을 수 있어서, 포함하면
+    ///   멀쩡한 계정에 스쳐 온 hit 하나가 영영 "판정 보류"로 남는다.
+    public func hasExhaustedAccountWindow() -> Bool {
+        (fiveHourPercent ?? 0) >= 100 || (sevenDayPercent ?? 0) >= 100
+    }
+
+    /// 계정 창이 한도에 **바짝 붙어** 있는가 — "아직 100%는 아니지만 곧"인 상태.
+    /// 로그가 소진을 말하는데 API가 살짝 못 따라온 경우를 버리지 않고 보류하는 데 쓴다.
+    public func hasNearLimitAccountWindow(threshold: Double) -> Bool {
+        (fiveHourPercent ?? 0) >= threshold || (sevenDayPercent ?? 0) >= threshold
+    }
 }
 
 public enum UsageFetcherError: Error, Equatable {
