@@ -5,11 +5,19 @@ public struct ProviderIdentity: Equatable, Sendable {
     public var emailAddress: String
     public var organizationName: String
     public var tierDescription: String
+    /// 조직 UUID — 같은 이메일의 다른 조직을 구분한다(`AccountKey`). 조직 개념이 없으면 "".
+    public var organizationUuid: String
 
-    public init(emailAddress: String, organizationName: String, tierDescription: String) {
+    public init(emailAddress: String, organizationName: String, tierDescription: String,
+                organizationUuid: String = "") {
         self.emailAddress = emailAddress
         self.organizationName = organizationName
         self.tierDescription = tierDescription
+        self.organizationUuid = organizationUuid
+    }
+
+    public var key: AccountKey {
+        AccountKey(emailAddress: emailAddress, organizationUuid: organizationUuid)
     }
 }
 
@@ -27,6 +35,11 @@ public protocol ProviderConfigIO: Sendable {
 
     /// 계정 식별 이메일. 주기 틱마다 호출되므로 승인창/네트워크 없는 값싼 경로여야 한다.
     func liveEmail() throws -> String?
+
+    /// 계정 열쇠(이메일 + 조직). `liveEmail`과 같은 값싼 경로여야 한다. 조직 개념이 없는
+    /// 프로바이더는 기본 구현(이메일만)으로 충분하다. **프로필 대조는 이메일이 아니라 이 값으로**
+    /// 한다 — 한 이메일이 여러 조직에 속할 수 있다(실패 기록 23).
+    func liveAccountKey() throws -> AccountKey?
 
     /// 표시용 메타데이터를 포함한 신원 (등록/adopt 시). 로그아웃 상태면 nil.
     func liveIdentity() throws -> ProviderIdentity?
@@ -49,6 +62,11 @@ public protocol ProviderConfigIO: Sendable {
 extension ProviderConfigIO {
     public func readStableLiveSecretData() async -> (data: Data, email: String)? {
         await readStableLiveSecretData(gap: .milliseconds(700))
+    }
+
+    /// 기본: 이메일만 (조직 미상). Claude처럼 조직이 있는 프로바이더가 덮어쓴다.
+    public func liveAccountKey() throws -> AccountKey? {
+        try liveEmail().map { AccountKey(emailAddress: $0) }
     }
 }
 

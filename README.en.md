@@ -185,6 +185,16 @@ Usage gauges are fetched only when the popover opens (4-minute cache) — never 
 
 ## Good to know
 
+- **One email in several organizations** (for example a personal Max plan plus a company
+  Team/Enterprise workspace): each organization is registered as its own account. Pick the
+  workspace in the "Add account" login window and each one gets its own card; from the
+  second one on, the nickname carries the organization name (or the plan tier for personal
+  subscriptions) so they are easy to tell apart. Accounts registered by an older version get
+  their organization filled in from the saved snapshot on first launch.
+  Note that **organizations already overwritten by an older version do not come back** — back
+  then one email shared a single profile, so only the organization you signed into last is
+  still there. The backfill only makes the surviving profiles consistent, so add the missing
+  organizations again through "Add account".
 - **Adding a Codex account**: in a terminal, run `codex logout` then `codex login`
   with the account you want to add — Mobius registers it automatically within seconds
   (your current account is already saved as a card, so you can switch back anytime).

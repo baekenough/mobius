@@ -259,6 +259,10 @@ final class AppState: ObservableObject {
             let warn = loc("구버전이 저장한 계정 목록에서 프로바이더 정보가 소실돼 복구했습니다: %@", names)
             initError = initError.map { "\($0)\n\(warn)" } ?? warn
         }
+        // 구버전 프로필(조직 미상)에 저장 스냅샷의 organizationUuid를 채운다 — 같은 이메일의 다른
+        // 조직으로 로그인했을 때 이 프로필이 이메일만으로 잡혀 덮어써지지 않게(실패 기록 23).
+        // 비밀 파일이 있는 계정만 읽으므로 Keychain 승인창은 뜨지 않는다.
+        _ = try? switcher.backfillOrganizationUUIDs()
         self.file = store.file
         self.lastError = initError
         // init에서의 직접 대입은 didSet이 불리지 않는다 — TTL 기준점을 수동 기록
@@ -980,7 +984,7 @@ final class AppState: ObservableObject {
     /// usage 조회에 쓸 자격증명 blob. **활성 계정은 라이브 토큰**을 쓴다 — 저장 스냅샷은 앱
     /// 시작 직후 만료 토큰일 수 있다(claude CLI가 라이브를 갱신한다).
     ///
-    /// ★ 라이브를 쓸 땐 **라이브 이메일이 그 프로필과 일치하는지 확인한다**(셀프리뷰 지적).
+    /// ★ 라이브를 쓸 땐 **라이브 계정 열쇠(이메일+조직)가 그 프로필과 일치하는지 확인한다**(셀프리뷰 지적).
     ///   `activeByProvider` 마커는 reconcile이 15초마다 맞추고 로그인 창이 열려 있으면 아예
     ///   건너뛰므로, 밖에서 계정이 바뀐 직후엔 **X의 토큰으로 조회한 결과를 Y에 기록**할 수
     ///   있다 — 이 PR이 없애려는 오귀인과 정확히 같은 클래스다. 이메일 확인은 `~/.claude.json`
@@ -990,9 +994,14 @@ final class AppState: ObservableObject {
     private func usageQueryBlob(for accountID: UUID) -> Data? {
         // ★ 순서 주의(실패 기록 3b): **값싼 이메일 확인을 먼저.** readLiveSnapshot은
         //   security CLI 서브프로세스라, 불일치로 버릴 결과를 먼저 읽으면 그 비용만 버린다.
+        // ★ 대조는 **`firstIndex(provider:matching:)` 한 곳**으로 한다(리뷰 지적). 여기서
+        //   `matches`를 직접 쓰면 관대한 쪽 규칙이 되어, 조직 미상 프로필이 아직 활성 마커를
+        //   쥐고 있는 동안 라이브가 이미 다른 조직으로 바뀌어 있어도 통과한다 — 그러면 org-A
+        //   토큰으로 조회한 사용량이 그 프로필에 기록된다(바로 이 주석이 말하는 오귀인).
         if store.file.activeAccountID == accountID,
-           let profileEmail = store.file.accounts.first(where: { $0.id == accountID })?.emailAddress,
-           let liveEmail = try? io.liveEmail(), liveEmail == profileEmail,
+           let idx = store.file.accounts.firstIndex(where: { $0.id == accountID }),
+           let liveKey = try? io.liveAccountKey(),
+           store.file.firstIndex(provider: io.provider, matching: liveKey) == idx,
            let live = try? io.readLiveSnapshot() {
             return live.keychainBlob
         }

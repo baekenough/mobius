@@ -70,12 +70,42 @@ public struct AdvisoryRecord: Codable, Equatable, Sendable {
     }
 }
 
+/// 한 프로바이더 안에서 계정을 구분하는 열쇠 — 이메일 **과 조직**.
+///
+/// 이메일 하나로는 부족하다(실패 기록 23): Claude는 한 이메일이 여러 조직(개인 Max·회사 Team·
+/// 회사 Enterprise)에 동시에 속할 수 있고, 조직마다 자격증명·한도·약관이 따로다. `~/.claude.json`의
+/// `oauthAccount.organizationUuid`가 그 조직을 가리킨다.
+/// `organizationUuid`가 빈 문자열이면 "조직을 모른다"는 뜻이다 — 조직 개념이 없는 프로바이더(Codex),
+/// 이 필드가 생기기 전에 등록된 구버전 프로필, 조직 정보를 안 주는 옛 claude.json. 이때는
+/// 이메일만으로 대조해 예전 동작을 유지한다(`matches`).
+public struct AccountKey: Equatable, Sendable {
+    public var emailAddress: String
+    public var organizationUuid: String
+
+    public init(emailAddress: String, organizationUuid: String = "") {
+        self.emailAddress = emailAddress
+        self.organizationUuid = organizationUuid
+    }
+
+    /// 같은 계정으로 볼 수 있는가. 양쪽이 조직을 알면 조직까지 같아야 하고, 한쪽이라도 모르면
+    /// 이메일만 본다. "정확히 맞는 쪽 우선"이 필요한 조회는 `AccountsFile.firstAccount(provider:matching:)`.
+    public func matches(_ other: AccountKey) -> Bool {
+        guard emailAddress == other.emailAddress else { return false }
+        if organizationUuid.isEmpty || other.organizationUuid.isEmpty { return true }
+        return organizationUuid == other.organizationUuid
+    }
+}
+
 public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
     public var id: UUID
     public var provider: Provider
     public var nickname: String
     public var emailAddress: String
     public var organizationName: String
+    /// 조직 UUID (`~/.claude.json` oauthAccount.organizationUuid). 같은 이메일의 다른 조직을
+    /// 구분한다 — `AccountKey` 참조. 구버전 프로필은 "" (앱·CLI가 로드 직후 저장 스냅샷에서 채운다:
+    /// `Switcher.backfillOrganizationUUIDs`).
+    public var organizationUuid: String
     public var tierDescription: String      // 표시용 예: "Max 20x", "Team", "Pro"
     public var needsReauth: Bool
     public var rateLimit: RateLimitInfo?
@@ -93,13 +123,14 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
     public var advisory: AdvisoryRecord?
 
     public init(id: UUID, provider: Provider = .claude, nickname: String, emailAddress: String,
-                organizationName: String, tierDescription: String,
+                organizationName: String, tierDescription: String, organizationUuid: String = "",
                 needsReauth: Bool = false, rateLimit: RateLimitInfo? = nil,
                 hasDesktopSnapshot: Bool = false, userPinned: Bool = false,
                 pinnedAt: Date? = nil, advisory: AdvisoryRecord? = nil) {
         self.id = id; self.provider = provider
         self.nickname = nickname; self.emailAddress = emailAddress
         self.organizationName = organizationName; self.tierDescription = tierDescription
+        self.organizationUuid = organizationUuid
         self.needsReauth = needsReauth; self.rateLimit = rateLimit
         self.hasDesktopSnapshot = hasDesktopSnapshot; self.userPinned = userPinned
         self.pinnedAt = pinnedAt; self.advisory = advisory
@@ -114,6 +145,7 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
         nickname = try c.decode(String.self, forKey: .nickname)
         emailAddress = try c.decode(String.self, forKey: .emailAddress)
         organizationName = try c.decodeIfPresent(String.self, forKey: .organizationName) ?? ""
+        organizationUuid = try c.decodeIfPresent(String.self, forKey: .organizationUuid) ?? ""
         tierDescription = try c.decodeIfPresent(String.self, forKey: .tierDescription) ?? ""
         needsReauth = try c.decodeIfPresent(Bool.self, forKey: .needsReauth) ?? false
         rateLimit = try c.decodeIfPresent(RateLimitInfo.self, forKey: .rateLimit)
@@ -121,6 +153,28 @@ public struct AccountProfile: Codable, Equatable, Identifiable, Sendable {
         userPinned = try c.decodeIfPresent(Bool.self, forKey: .userPinned) ?? false
         pinnedAt = try c.decodeIfPresent(Date.self, forKey: .pinnedAt)
         advisory = try c.decodeIfPresent(AdvisoryRecord.self, forKey: .advisory)
+    }
+
+    /// 프로바이더 풀 안에서 이 프로필을 가리키는 열쇠 (이메일 + 조직).
+    public var key: AccountKey {
+        AccountKey(emailAddress: emailAddress, organizationUuid: organizationUuid)
+    }
+
+    /// 표시용 조직 이름. 개인 구독의 자동 생성 조직은 이름에 정보가 없으므로 비운다 — 회사 조직
+    /// (Team/Enterprise)의 이름만 같은 이메일의 계정들을 구분하는 데 쓸모가 있다.
+    public var organizationLabel: String {
+        Self.isPersonalOrganizationName(organizationName, email: emailAddress) ? "" : organizationName
+    }
+
+    /// 카드·CLI의 부제 — 조직 이름과 등급 중 **있는 것만** " · "로 잇는다(빈 쪽이 있으면 구분자도 없다).
+    public var subtitle: String {
+        [organizationLabel, tierDescription].filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+
+    /// 개인 구독의 자동 생성 조직인가 — 실측 형태는 `"<이메일>'s Organization"`. 휴리스틱이라
+    /// 틀려도 결과는 "조직 이름을 표시하느냐" 정도의 차이뿐이다(대조에는 쓰지 않는다).
+    public static func isPersonalOrganizationName(_ name: String, email: String) -> Bool {
+        name.isEmpty || name.hasPrefix(email) || name.hasSuffix("'s Organization")
     }
 
     /// 지금 한도에 걸려 있는가 (리셋 시각 전인가)
@@ -308,6 +362,68 @@ public struct AccountsFile: Codable, Equatable, Sendable {
 
     public func isAutoSwitchedFromPrimary(_ provider: Provider) -> Bool {
         autoSwitchedByProvider[provider] ?? false
+    }
+
+    // MARK: 계정 열쇠 대조 (이메일 + 조직)
+
+    /// key와 같은 계정의 인덱스. **조직까지 정확히 맞는 프로필을 먼저** 찾고, 없으면 조직을 모르는
+    /// 쪽(구버전 프로필, 또는 조직 없는 key)만 이메일로 맞춘다 — 같은 이메일에 조직 A·B 프로필이
+    /// 둘 다 있을 때 A의 열쇠가 B를 잡는 일이 없어야 한다. 계정이 없으면 nil.
+    ///
+    /// ★ **이메일 폴백에서 후보가 둘 이상이면 nil이다.** 조직을 모르는 열쇠와 이메일이 같은
+    ///   프로필이 여럿인 상태는 이 변경 이후에 처음 생긴다(그전엔 이메일당 하나였다). 그때
+    ///   배열 순서로 아무거나 잡으면 `resaveLiveIntoMatchingProfile`·`reconcile`이 **남의 조직
+    ///   토큰을 그 프로필에 저장하고 setActive까지** 한다 — 이 저장소에서 가장 비싼 실패
+    ///   클래스(실패 기록 1·13)와 같은 모양이다. 잘못된 기록보다 미룬 판정이 낫다(실패 기록 21):
+    ///   소비자는 nil을 받으면 아무것도 안 하고 다음 틱에 다시 본다. 폴백이 더 자주 나는 것뿐
+    ///   손해가 없는 방향이다.
+    public func firstIndex(provider: Provider, matching key: AccountKey) -> Int? {
+        let sameEmail = accounts.indices.filter {
+            accounts[$0].provider == provider && accounts[$0].emailAddress == key.emailAddress
+        }
+        if !key.organizationUuid.isEmpty,
+           let exact = sameEmail.first(where: { accounts[$0].organizationUuid == key.organizationUuid }) {
+            return exact
+        }
+        // 여기부터는 한쪽이 조직을 모르는 이메일 폴백이다 — 모호하면 손대지 않는다.
+        let loose = sameEmail.filter { accounts[$0].key.matches(key) }
+        return loose.count == 1 ? loose.first : nil
+    }
+
+    public func firstAccount(provider: Provider, matching key: AccountKey) -> AccountProfile? {
+        firstIndex(provider: provider, matching: key).map { accounts[$0] }
+    }
+
+    /// 새 프로필의 기본 닉네임 — 이메일 앞부분. 같은 풀에 이미 그 이름이 있으면(같은 이메일의 다른
+    /// 조직) 조직 이름(개인 구독이면 등급)을 붙여 구분하고, 그래도 겹치면 번호를 단다.
+    /// 닉네임은 CLI `switch <닉네임>`의 열쇠라 한 풀 안에서 겹치면 그 계정을 고를 수 없다.
+    public func suggestedNickname(provider: Provider, for identity: ProviderIdentity) -> String {
+        let base = String(identity.emailAddress.split(separator: "@").first ?? "account")
+        let taken = Set(accounts(of: provider).map(\.nickname))
+        guard taken.contains(base) else { return base }
+        let personal = AccountProfile.isPersonalOrganizationName(identity.organizationName,
+                                                                 email: identity.emailAddress)
+        let tag = Self.nicknameSlug(personal ? identity.tierDescription : identity.organizationName)
+        let candidate = tag.isEmpty ? base : "\(base)-\(tag)"
+        guard taken.contains(candidate) else { return candidate }
+        var n = 2
+        while taken.contains("\(candidate)-\(n)") { n += 1 }
+        return "\(candidate)-\(n)"
+    }
+
+    /// 닉네임 꼬리표용 슬러그: 소문자, 영숫자 외는 '-' 하나로, 앞뒤 '-' 제거.
+    static func nicknameSlug(_ s: String) -> String {
+        var out = ""
+        var pendingDash = false
+        for ch in s.lowercased() {
+            if ch.isLetter || ch.isNumber {
+                if pendingDash { out.append("-"); pendingDash = false }
+                out.append(ch)
+            } else if !out.isEmpty {
+                pendingDash = true
+            }
+        }
+        return out
     }
 
     /// 풀별 자동 전환 on/off — 기록이 없는 풀은 켬(기본값)

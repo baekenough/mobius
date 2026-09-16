@@ -24,12 +24,14 @@ Scripts/setup-signing.sh      # (1회) 고정 서명 인증서 생성 — 아래
 Sources/MobiusCore/       앱·CLI 공유 코어 (전부 의존성 주입 → 테스트 가능)
   MobiusEnvironment.swift  모든 경로 컨테이너 (MOBIUS_HOME/CODEX_HOME 오버라이드)
   Models.swift             Provider / AccountProfile / AccountsFile(프로바이더별 풀) / RateLimitInfo
+                           AccountKey(이메일+조직 열쇠 — 계정 대조는 firstIndex(provider:matching:) 한 곳)
   ProviderConfigIO.swift   프로바이더 어댑터 프로토콜 (secret data = 프로바이더 정의 바이트)
   KeychainClient.swift     SystemKeychain + InMemoryKeychain(테스트)
   ClaudeConfigIO.swift     Claude 자격증명 읽기/쓰기 (★ 아래 '진실의 원천' 필독)
   AccountStore.swift       프로필 영속(accounts.json) + 비밀 스냅샷(0600 파일, opaque Data)
   CodexConfigIO.swift      Codex 자격증명 읽기/쓰기 (auth.json 통째 스왑, JWT 신원)
   Switcher.swift           전환/되저장/롤백/reconcile/adopt — 등록된 어댑터 풀 전체에 적용
+                           backfillOrganizationUUIDs: 구버전 프로필 조직 채우기(저장 스냅샷 기준)
   RateLimitParser.swift    Claude 세션 로그 rate-limit 이벤트 파서 (실측 기반)
   CodexRateLimitParser.swift Codex rate_limits 상태 파서 (매 턴 in-band, 게이지+소진 판정)
   CodexStatusRouter.swift  Codex 상태의 계정 귀속 — 전환 전 세션 파일 격리 (오염 방지 ★아래)
@@ -53,6 +55,12 @@ Sources/MobiusApp/        SwiftUI 메뉴바 앱 + AppState + Views/ + LoginFlow 
   → `readLiveSnapshot()`은 **반드시 Keychain 우선**. 파일은 Keychain이 빈 경우의 폴백일 뿐.
 - **이메일/계정 메타**: `~/.claude.json` 의 `oauthAccount.emailAddress`. 자격증명 blob에는 계정
   식별자가 **없다** (accessToken/refreshToken/expiresAt/subscriptionType 뿐).
+- **계정의 정체 = (emailAddress, organizationUuid)** — `oauthAccount.organizationUuid`. 한 이메일이
+  여러 조직(개인 Max + 회사 Team + 회사 Enterprise)에 **동시에** 속한다(실측 2026-09-11: 계정 메뉴에
+  워크스페이스 3개, UUID 각각 다름). 이메일만으로 대조하면 두 번째 조직 로그인이 첫 프로필을
+  덮어쓴다(실패 기록 23). `organizationName`은 표시용일 뿐이고 개인 구독은
+  `"<이메일>'s Organization"`으로 자동 생성된다(`organizationType`: `claude_max` / `claude_team` /
+  `claude_enterprise`). 코드는 `AccountKey`, 대조는 `AccountsFile.firstIndex(provider:matching:)`.
 - **전환 = 3곳 스왑**: Keychain + .credentials.json + ~/.claude.json 의 oauthAccount.
 
 ### 사용량 엔드포인트
@@ -621,6 +629,42 @@ Sources/MobiusApp/        SwiftUI 메뉴바 앱 + AppState + Views/ + LoginFlow 
     결정에서 빠진다 — 게이지가 이미 아는 것을 결정이 모르면 사용자는 화면과 동작이 어긋난다고 느낀다.
     정보원을 바꿔 붙일 때는 **그 정보원이 쓰던 술어를 그대로 재사용하지 말고** 무엇을 묻는
     술어인지부터 확인한다. 같은 필드를 읽어도 "hit을 만든다"와 "지금 쓸 수 있는가"는 경계가 다르다.
+23. **계정 정체를 이메일 하나로 잡아 같은 이메일의 다른 조직이 프로필을 덮어씀 (외부 제보, 2026-09-11)** —
+    프로필 대조 8곳(`AccountStore.upsertProfile`, `Switcher`의 resave/refresh/adopt/reconcile,
+    `LoginFlow`의 닉네임 재사용·재로그인 판정, `AppState.usageQueryBlob`)이 전부
+    `(provider, emailAddress)`만 봤다. claude.ai는 **한 이메일이 여러 조직**(개인 Max + 회사 Team +
+    회사 Enterprise)에 동시에 속할 수 있고(계정 메뉴에 워크스페이스 3개, `organizationUuid` 각각
+    다름), 조직마다 토큰·한도·약관이 별개다. "계정 추가"로 워크스페이스를 바꿔 로그인할 때마다
+    **같은 프로필 하나가 덮어써져** 목록은 그대로고 직전 조직의 토큰은 `.bak`에만 남았다. 덤으로
+    `LoginFlow`가 `email == baselineEmail`로 "같은 계정 재로그인"이라 오판해 원래 계정 복원을
+    건너뛰어 **라이브 로그인이 마지막 조직으로 바뀐 채** 끝났고, 옛 조직에서 기록된 `rateLimit`이
+    새 조직 라벨 아래 그대로 남아 "Max 20X 한도 소진"처럼 보였다.
+    → 정체는 `AccountKey(emailAddress, organizationUuid)`. 대조는 `AccountsFile.firstIndex(provider:
+    matching:)` **한 곳**으로 모았다(정확한 조직 우선 → 조직 미상 쪽만 이메일 폴백, 그래서 Codex와
+    구버전 프로필은 예전대로 동작). 조직 미상 구버전 프로필은 로드 직후
+    `Switcher.backfillOrganizationUUIDs`가 **저장 스냅샷**에서 채운다 — 라이브에서 채우면 지금
+    로그인한 조직으로 오귀속된다. 새 프로필 닉네임은 `AccountsFile.suggestedNickname`이 조직명
+    (개인 구독은 등급)을 붙여 한 풀 안에서 겹치지 않게 한다 — 닉네임은 CLI `switch`의 열쇠이고
+    앱에 이름 바꾸기가 없다. 되저장·reconcile은 안정 읽기 뒤 열쇠를 **한 번 더** 읽어 그 사이
+    같은 이메일의 다른 조직으로 바뀐 경우를 걸러낸다(파일 읽기 한 번, 승인창 무관).
+    교훈: (1) "이메일 = 계정"은 프로바이더의 사실이 아니라 **우리가 세운 가정**이었다 — 신원
+    필드가 여러 개 오면(`organizationUuid`·`organizationName`·`organizationType`) 무엇이 정체이고
+    무엇이 표시용인지 실측으로 못 박아라. (2) 같은 대조 규칙이 8곳에 복사돼 있으면 규칙을 바꿀 때
+    하나는 반드시 빠진다 — 21(2d)과 같은 클래스. 규칙은 한 함수로 모으고 전부 그걸 부르게 하라.
+    (3) 개발자 본인이 조직 하나만 쓰면 자체 발견이 불가능한, 사용자 구성이 조건인 버그(13·17·20·21과
+    같은 클래스). 외부 제보가 유일한 발견 경로였다.
+    ★ 리뷰에서 드러난 경계 셋. (a) **대조 규칙은 한 함수로 모았어도 한 곳만 빠지면 그만이다** —
+    `AppState.usageQueryBlob`이 관대한 `matches`를 직접 쓰고 있었고, 그러면 조직 미상 프로필이
+    아직 활성 마커를 쥔 사이에 다른 조직 토큰으로 조회한 사용량이 그 프로필에 기록된다.
+    폴백 경로(저장 스냅샷을 id로 꺼내기)는 애초에 오귀인 안전하므로 규칙을 조이면 폴백이 더 자주
+    날 뿐 손해가 없다. (b) **모호하면 nil이다** — 조직을 모르는 열쇠에 같은 이메일 후보가 여럿인
+    상태는 이 변경 **이후에** 처음 생긴다(그전엔 이메일당 하나였다). 배열 순서로 아무거나 잡으면
+    남의 조직 토큰을 저장하고 setActive까지 간다. 21의 "잘못된 기록보다 미룬 판정"을 그대로 적용해
+    `firstIndex`가 nil을 돌려주고, 소비자는 다음 틱에 다시 본다. (c) **UUID만 채우면 라벨과 토큰이
+    어긋난 채 굳는다** — 구버전 되저장은 비밀만 덮어썼으므로 "라벨은 회사 Team, 저장 토큰은 개인
+    Max"인 프로필이 있을 수 있다. backfill이 같은 스냅샷에서 이름·등급도 맞춘다(빈 값으로는 덮어쓰지
+    않는다 — 정보만 사라진다). 마이그레이션 한계는 README에 적었다: **이미 덮어써진 조직은 돌아오지
+    않는다**(직전 것만 `.bak`에 남는다). backfill은 살아남은 프로필을 일관되게 만들 뿐이다.
 
 ## QA / 진행 상황
 

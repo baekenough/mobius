@@ -66,7 +66,44 @@ public final class Switcher: @unchecked Sendable {
         return fixed
     }
 
-    /// 현재 라이브 상태를, (provider, email)이 일치하는 프로필에 되저장한다.
+    /// 구버전 프로필(organizationUuid 없음)에 **저장 스냅샷**의 조직 UUID를 채운다.
+    /// 이메일만으로 대조하던 시절의 프로필은 조직을 모른다. 그대로 두면 같은 이메일의 **다른**
+    /// 조직으로 로그인했을 때 이 프로필이 이메일만으로 잡혀 덮어써진다 — 고치려는 버그 그대로다
+    /// (실패 기록 23). 저장 스냅샷의 oauthAccount 블록이 그 프로필의 진짜 조직을 알고 있으므로
+    /// 거기서 채운다 — 라이브를 보지 않으니 지금 어느 조직으로 로그인했든 오귀속되지 않는다.
+    /// 비밀 **파일이 있는** 계정만 읽는다(stat 게이트) — 구버전 Keychain 폴백(승인창)은 타지 않는다.
+    /// 반환: 채워 넣은 프로필 id. 앱 시작·CLI 변경 명령에서 heal 직후 1회 호출.
+    ///
+    /// ★ 조직 UUID만 채우면 **라벨과 토큰이 어긋난 채로 굳는다**(리뷰 지적). 이 버그를 이미
+    ///   맞은 프로필은 v0.5.3의 되저장이 이메일로 맞춰 **비밀만** 덮어쓴 결과라, "라벨은
+    ///   Acme Team인데 저장 스냅샷 토큰은 개인 Max"일 수 있다. 거기에 개인 Max의 UUID만 찍으면
+    ///   카드는 계속 회사 조직을 말하면서 실제로는 개인 계정이 된다 — 데이터는 안 잃지만
+    ///   사용자가 영영 오해한다. 스냅샷이 그 프로필의 자격증명 진실이므로 같은 identity에서
+    ///   이름과 등급도 함께 맞춘다. 다만 **빈 값으로는 덮어쓰지 않는다** — 구버전 스냅샷의
+    ///   oauthAccount는 organizationName이 없을 수 있고, 그때 멀쩡한 표시를 지우면 어긋남은
+    ///   안 줄고 정보만 사라진다.
+    @discardableResult
+    public func backfillOrganizationUUIDs() throws -> [UUID] {
+        var filled: [UUID] = []
+        for account in store.file.accounts
+        where account.provider == .claude && account.organizationUuid.isEmpty {
+            guard FileManager.default.fileExists(atPath: env.secretFile(for: account.id).path),
+                  let data = try? store.secretData(for: account.id),
+                  let snap = try? JSONDecoder().decode(CredentialsSnapshot.self, from: data),
+                  let identity = ClaudeConfigIO.identity(fromSnapshot: snap),
+                  !identity.organizationUuid.isEmpty
+            else { continue }
+            try store.update(account.id) {
+                $0.organizationUuid = identity.organizationUuid
+                if !identity.organizationName.isEmpty { $0.organizationName = identity.organizationName }
+                if !identity.tierDescription.isEmpty { $0.tierDescription = identity.tierDescription }
+            }
+            filled.append(account.id)
+        }
+        return filled
+    }
+
+    /// 현재 라이브 상태를, (provider, 계정 열쇠)가 일치하는 프로필에 되저장한다.
     /// 반환: 되저장된 프로필 id (일치 프로필 없으면 nil).
     /// 사용자 전환(switchTo) 직전에 호출 — 라이브가 settled 상태이므로 단일 읽기로 충분하다.
     /// provider 기본값 없음 — 풀을 바꾸는 연산은 대상 풀을 항상 명시한다 (오라우팅 방지).
@@ -74,10 +111,8 @@ public final class Switcher: @unchecked Sendable {
     public func resaveLiveIntoMatchingProfile(provider: Provider) throws -> UUID? {
         guard let io = ios[provider],
               let live = try io.readLiveSecretData(),
-              let email = try io.liveEmail(),
-              let profile = store.file.accounts.first(where: {
-                  $0.provider == provider && $0.emailAddress == email
-              })
+              let key = try io.liveAccountKey(),
+              let profile = store.file.firstAccount(provider: provider, matching: key)
         else { return nil }
         try saveLiveSecret(live, for: profile.id)
         return profile.id
@@ -127,13 +162,14 @@ public final class Switcher: @unchecked Sendable {
         // (Codex auth.json은 실행 세션이 수시로 다시 쓰는 "바쁜 파일"이라 이 경로에서 제외.)
         let provider = Provider.claude
         guard let io = ios[provider],
-              let email = try? io.liveEmail(),
-              let profile = store.file.accounts.first(where: {
-                  $0.provider == provider && $0.emailAddress == email
-              }),
+              let key = try? io.liveAccountKey(),
+              let profile = store.file.firstAccount(provider: provider, matching: key),
               profile.id == store.file.activeByProvider[provider] else { return false }
+        // 안정 읽기 뒤 열쇠를 한 번 더 확인한다 — 같은 이메일의 다른 조직으로 로그인이 끝난 직후라면
+        // 이메일은 같아도 조직이 달라, 이 프로필에 남의 조직 토큰을 저장하게 된다(파일 읽기 한 번).
         guard let (data, stableEmail) = await io.readStableLiveSecretData(),
-              stableEmail == email else { return false }
+              stableEmail == key.emailAddress,
+              (try? io.liveAccountKey()) == key else { return false }
         do {
             try saveLiveSecret(data, for: profile.id)
             return true
@@ -188,28 +224,28 @@ public final class Switcher: @unchecked Sendable {
 
     private func adoptLiveAccount(provider: Provider,
                                   io: any ProviderConfigIO) async throws -> AccountProfile? {
-        // ★ 등록 여부를 먼저 확인 — 이메일 읽기는 승인창 없는 값싼 경로다(프로토콜 계약).
+        // ★ 등록 여부를 먼저 확인 — 열쇠(이메일+조직) 읽기는 승인창 없는 값싼 경로다(프로토콜 계약).
         //   Claude의 Keychain 읽기(승인창 유발)는 정말 미등록일 때만.
-        guard let email = try io.liveEmail(),
-              !store.file.accounts.contains(where: {
-                  $0.provider == provider && $0.emailAddress == email
-              })
+        //   같은 이메일이라도 조직이 다르면 미등록이다 — 회사 Team과 개인 Max를 한 이메일로 쓰는
+        //   사용자의 두 번째 조직이 여기서 새 프로필로 흡수된다.
+        guard let key = try io.liveAccountKey(),
+              store.file.firstAccount(provider: provider, matching: key) == nil
         else { return nil }
         // 비밀+이메일을 두 번 읽어 일치할 때만(전환/리프레시 중 불일치 배제) 저장한다.
         guard let (live, stableEmail) = await io.readStableLiveSecretData(),
-              stableEmail == email,
-              let identity = try io.liveIdentity(), identity.emailAddress == email
+              stableEmail == key.emailAddress,
+              let identity = try io.liveIdentity(), identity.key == key
         else { return nil }
-        let nickname = String(email.split(separator: "@").first ?? "account")
+        let nickname = store.file.suggestedNickname(provider: provider, for: identity)
         let profile = try store.upsertProfile(nickname: nickname, provider: provider,
                                               identity: identity, secretData: live)
         try store.setActive(profile.id)
         return profile
     }
 
-    /// 외부(앱 밖) 재로그인 감지 시 상태 대사 (전 프로바이더): 라이브 email이 아는
-    /// 프로필이면 그 프로필을 활성으로 표시하고 최신 토큰을 흡수한다.
-    /// 모르는 계정이면 손대지 않는다.
+    /// 외부(앱 밖) 재로그인 감지 시 상태 대사 (전 프로바이더): 라이브 계정 열쇠(이메일+조직)가
+    /// 아는 프로필이면 그 프로필을 활성으로 표시하고 최신 토큰을 흡수한다.
+    /// 모르는 계정(같은 이메일의 다른 조직 포함)이면 손대지 않는다 — adopt가 새 프로필로 흡수한다.
     public func reconcile() async throws {
         for (provider, io) in orderedIOs {
             try await reconcile(provider: provider, io: io)
@@ -217,12 +253,10 @@ public final class Switcher: @unchecked Sendable {
     }
 
     private func reconcile(provider: Provider, io: any ProviderConfigIO) async throws {
-        // 이메일은 승인창 없는 값싼 경로로 읽는다. 활성 계정이 그대로면 비밀 읽기
+        // 열쇠(이메일+조직)는 승인창 없는 값싼 경로로 읽는다. 활성 계정이 그대로면 비밀 읽기
         // (Claude는 Keychain)를 아예 하지 않아 15초 주기 승인창 폭탄을 막는다.
-        guard let email = try io.liveEmail(),
-              let profile = store.file.accounts.first(where: {
-                  $0.provider == provider && $0.emailAddress == email
-              })
+        guard let key = try io.liveAccountKey(),
+              let profile = store.file.firstAccount(provider: provider, matching: key)
         else { return }
         let activeUnchanged = store.file.activeByProvider[provider] == profile.id
         // 존재 확인은 stat으로 — 15초 주기 정상 경로에서 비밀 파일 전체를 읽지 않는다
@@ -232,9 +266,11 @@ public final class Switcher: @unchecked Sendable {
             || (try? store.secretData(for: profile.id)) != nil
         if activeUnchanged && alreadyHasSecret { return } // 정상 상태 — 비밀 접근 없음
 
-        // 실제 변화가 있을 때만(드묾) 비밀+이메일 두 번 읽어 일치 확인 후 저장.
+        // 실제 변화가 있을 때만(드묾) 비밀+이메일 두 번 읽어 일치 확인 후 저장. 열쇠를 한 번 더
+        // 읽어 그 사이 같은 이메일의 다른 조직으로 바뀌지 않았는지도 확인한다(파일 읽기 한 번).
         guard let (live, stableEmail) = await io.readStableLiveSecretData(),
-              stableEmail == email else { return }
+              stableEmail == key.emailAddress,
+              (try? io.liveAccountKey()) == key else { return }
         try saveLiveSecret(live, for: profile.id)
         if !activeUnchanged {
             try store.setActive(profile.id)

@@ -28,7 +28,7 @@ final class LoginFlowController: NSObject, ASWebAuthenticationPresentationContex
         try switcher.resaveLiveIntoMatchingProfile(provider: .claude)
         let previous = try io.readLiveSnapshot()
         let previousActiveID = store.file.activeAccountID
-        let baselineEmail = try io.liveEmail()
+        let baselineKey = try io.liveAccountKey()
 
         defer { cleanup() }
 
@@ -56,12 +56,18 @@ final class LoginFlowController: NSObject, ASWebAuthenticationPresentationContex
                snap.keychainBlob != previous?.keychainBlob {
                 session?.cancel(); session = nil   // 창 닫기
 
-                let nickname = store.file.accounts
-                    .first { $0.provider == .claude && $0.emailAddress == email }?.nickname
-                    ?? String(email.split(separator: "@").first ?? "account")
+                // 같은 이메일이라도 조직이 다르면 다른 계정이다(AccountKey, 실패 기록 23) — 회사 Team과
+                // 개인 Max를 한 이메일로 쓰는 사용자의 두 번째 로그인이 첫 프로필을 덮어쓰면 안 된다.
+                let identity = ClaudeConfigIO.identity(fromSnapshot: snap)
+                    ?? ProviderIdentity(emailAddress: email, organizationName: "", tierDescription: "")
+                let nickname = store.file.firstAccount(provider: .claude, matching: identity.key)?.nickname
+                    ?? store.file.suggestedNickname(provider: .claude, for: identity)
                 let profile = try store.upsertProfile(nickname: nickname, snapshot: snap)
 
-                if email == baselineEmail {
+                // ★ `matches`가 아니라 **정확 비교**다 — 관대한 대조로 바꾸면 같은 이메일의 다른
+                //   조직 로그인이 "재로그인"으로 보여 이 변경이 고치는 버그가 그대로 돌아온다.
+                let sameAccount = identity.key == baselineKey
+                if sameAccount {
                     MobiusNotification.postAccountsChanged()
                     return .refreshed(profile)
                 }

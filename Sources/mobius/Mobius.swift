@@ -15,6 +15,9 @@ struct MobiusCLI: AsyncParsableCommand {
 ///   에서만 켠다** — heal은 계정당 secret 파일을 읽고(레거시 계정은 Keychain 폴백까지),
 ///   교정 시 accounts.json을 저장하므로 읽기 전용 명령(list/status)에는 과하다(리뷰 반영).
 ///   미복구 상태의 표시 오류는 앱 실행 시 또는 전환 시점 heal이 잡는다.
+///   ★ `backfillOrganizationUUIDs`도 같은 게이트를 쓴다 — 그래서 업그레이드 후 앱을 아직 안 켠
+///   사용자에게는 `list`/`status`에 조직 이름이 안 뜬다. 의도한 동작이다: 읽기 전용 명령은
+///   accounts.json을 고치지 않는다는 기존 정책이 우선이고, 다음 변경 명령이나 앱 실행이 채운다.
 func makeContext(healProviders: Bool = false) throws -> (
     env: MobiusEnvironment, store: AccountStore,
     io: ClaudeConfigIO, codexIO: CodexConfigIO, switcher: Switcher) {
@@ -24,12 +27,17 @@ func makeContext(healProviders: Bool = false) throws -> (
     let io = ClaudeConfigIO(env: env, keychain: kc)
     let codexIO = CodexConfigIO(env: env)
     let switcher = Switcher(env: env, keychain: kc, store: store, io: io, extraIOs: [codexIO])
-    if healProviders,
-       let reassigned = try? switcher.healMisassignedProviders(), !reassigned.isEmpty {
-        for r in reassigned {
-            FileHandle.standardError.write(Data(
-                "⚠️ 프로바이더 정보 소실을 복구했습니다: \(r.nickname) (\(r.from.rawValue) → \(r.to.rawValue))\n".utf8))
+    if healProviders {
+        if let reassigned = try? switcher.healMisassignedProviders(), !reassigned.isEmpty {
+            for r in reassigned {
+                FileHandle.standardError.write(Data(
+                    "⚠️ 프로바이더 정보 소실을 복구했습니다: \(r.nickname) (\(r.from.rawValue) → \(r.to.rawValue))\n".utf8))
+            }
         }
+        // 구버전 프로필(조직 미상)에 저장 스냅샷의 organizationUuid를 채운다 — 같은 이메일의 다른
+        // 조직 로그인이 이 프로필을 덮어쓰지 않게(실패 기록 23). 비밀 파일이 있는 계정만 읽으므로
+        // 승인창은 뜨지 않는다.
+        _ = try? switcher.backfillOrganizationUUIDs()
     }
     return (env, store, io, codexIO, switcher)
 }
@@ -68,7 +76,8 @@ struct List: AsyncParsableCommand {
                 let active = p.id == ctx.store.file.activeByProvider[provider] ? "●" : "○"
                 let role = i == 0 ? "primary " : "fallback\(i)"
                 let reauth = p.needsReauth ? "  [재로그인 필요]" : ""
-                print("  \(active) \(role)  \(p.nickname)  <\(p.emailAddress)>  \(p.tierDescription)\(fmtReset(p))\(reauth)")
+                // 회사 조직(Team/Enterprise) 이름을 함께 적는다 — 같은 이메일의 계정이 여럿일 때 구분 근거.
+                print("  \(active) \(role)  \(p.nickname)  <\(p.emailAddress)>  \(p.subtitle)\(fmtReset(p))\(reauth)")
             }
         }
     }
@@ -92,8 +101,21 @@ struct Switch: ParsableCommand {
             throw ValidationError("'\(name)' 계정 없음. 등록된 계정: \(names)")
         }
         guard matches.count == 1 else {
+            if Set(matches.map(\.provider)).count > 1 {
+                throw ValidationError(
+                    "'\(name)' 닉네임이 여러 프로바이더에 있습니다. --provider claude|codex 로 지정하세요.")
+            }
+            // 같은 풀 안의 중복 — 같은 이메일의 다른 조직을 같은 이름으로 capture한 경우.
+            let orgs = matches.map { $0.organizationLabel.isEmpty ? $0.tierDescription : $0.organizationLabel }
+                .joined(separator: ", ")
+            // ★ 안내가 회복 경로까지 말해야 한다(리뷰 지적) — 중복 닉네임은 `switch`로 고를 수
+            //   없으므로 "그 계정으로 로그인"을 `mobius switch`로는 할 수 없다. 그래서 claude에서
+            //   직접 로그인하는 경로를 명시한다. (구버전에서 이메일 앞부분만으로 adopt된
+            //   `leo@a.com`·`leo@b.com`이 둘 다 `leo`가 된 사용자가 실제로 이 상태다.)
             throw ValidationError(
-                "'\(name)' 닉네임이 여러 프로바이더에 있습니다. --provider claude|codex 로 지정하세요.")
+                "'\(name)' 닉네임의 계정이 같은 프로바이더에 여러 개입니다 (\(orgs)). "
+                + "`claude`에서 그 계정으로 직접 로그인한 뒤 "
+                + "`mobius capture <다른 닉네임>`으로 이름을 바꾸세요.")
         }
         try ctx.switcher.switchTo(target.id)
         // 사용자의 의지로 전환 — 앱 onTick의 primary 자동 복귀 대상이 아니다
@@ -126,7 +148,8 @@ struct Status: AsyncParsableCommand {
             guard let active = ctx.store.file.active(of: provider) else { continue }
             let role = active.id == ctx.store.file.primary(of: provider)?.id
                 ? "primary" : "fallback"
-            print("[\(provider.displayName)] 활성: \(active.nickname) <\(active.emailAddress)> (\(role))\(fmtReset(active))")
+            let org = active.organizationLabel.isEmpty ? "" : " \(active.organizationLabel)"
+            print("[\(provider.displayName)] 활성: \(active.nickname) <\(active.emailAddress)>\(org) (\(role))\(fmtReset(active))")
             printedAny = true
         }
         if !printedAny {
@@ -155,18 +178,38 @@ struct Capture: ParsableCommand {
             guard let snap = try ctx.io.readLiveSnapshot() else {
                 throw ValidationError("claude 로그인 상태가 아닙니다. 먼저 `claude`에서 /login 하세요.")
             }
+            guard let identity = ClaudeConfigIO.identity(fromSnapshot: snap) else {
+                throw ValidationError("~/.claude.json 에 계정 정보(oauthAccount)가 없습니다. `claude`에서 다시 로그인하세요.")
+            }
+            try Self.rejectNicknameTakenByAnotherAccount(name, provider: .claude,
+                                                        identity: identity, store: ctx.store)
             p = try ctx.store.upsertProfile(nickname: name, snapshot: snap)
         case .codex:
             guard let data = try ctx.codexIO.readLiveSecretData(),
                   let identity = try ctx.codexIO.liveIdentity() else {
                 throw ValidationError("codex 로그인 상태가 아닙니다. 먼저 `codex login` 하세요.")
             }
+            try Self.rejectNicknameTakenByAnotherAccount(name, provider: .codex,
+                                                        identity: identity, store: ctx.store)
             p = try ctx.store.upsertProfile(nickname: name, provider: .codex,
                                             identity: identity, secretData: data)
         }
         try ctx.store.setActive(p.id)
         MobiusNotification.postAccountsChanged()
-        print("캡처 완료: [\(p.provider.displayName)] \(p.nickname) <\(p.emailAddress)> \(p.tierDescription)")
+        print("캡처 완료: [\(p.provider.displayName)] \(p.nickname) <\(p.emailAddress)> \(p.subtitle)")
+    }
+
+    /// 같은 풀의 **다른** 계정이 이미 쓰는 닉네임이면 거부한다 — 같은 이름이 둘이면 `switch`가 고를
+    /// 수 없다. 같은 계정(열쇠 일치)의 재캡처(토큰 갱신·이름 변경)는 통과한다.
+    static func rejectNicknameTakenByAnotherAccount(_ name: String, provider: Provider,
+                                                    identity: ProviderIdentity,
+                                                    store: AccountStore) throws {
+        let sameAccount = store.file.firstAccount(provider: provider, matching: identity.key)?.id
+        guard let other = store.file.accounts(of: provider)
+            .first(where: { $0.nickname == name && $0.id != sameAccount }) else { return }
+        let what = other.organizationLabel.isEmpty ? other.tierDescription : other.organizationLabel
+        throw ValidationError(
+            "'\(name)' 닉네임은 이미 다른 계정(<\(other.emailAddress)> \(what))이 쓰고 있습니다. 다른 닉네임을 지정하세요.")
     }
 }
 

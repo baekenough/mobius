@@ -62,26 +62,31 @@ public final class AccountStore: @unchecked Sendable {
 
     // MARK: 프로필
 
-    /// (provider, email)로 기존 프로필을 찾아 갱신하거나 새로 만든다.
+    /// (provider, 계정 열쇠)로 기존 프로필을 찾아 갱신하거나 새로 만든다. 열쇠는 이메일 + 조직이다 —
+    /// 같은 이메일이라도 조직이 다르면 **다른 프로필**이 된다(`AccountKey`, 실패 기록 23).
     /// 그 프로바이더의 첫 계정은 자동 활성.
     @discardableResult
     public func upsertProfile(nickname: String, provider: Provider,
                               identity: ProviderIdentity, secretData: Data) throws -> AccountProfile {
         lock.lock(); defer { lock.unlock() }
         var profile: AccountProfile
-        if let idx = file.accounts.firstIndex(where: {
-            $0.provider == provider && $0.emailAddress == identity.emailAddress
-        }) {
+        if let idx = file.firstIndex(provider: provider, matching: identity.key) {
             file.accounts[idx].nickname = nickname
             file.accounts[idx].organizationName = identity.organizationName
             file.accounts[idx].tierDescription = identity.tierDescription
             file.accounts[idx].needsReauth = false
+            if !identity.organizationUuid.isEmpty {
+                // 조직을 모르던 구버전 프로필이 이메일로 맞았으면 이번 신원의 조직을 채운다 —
+                // 다음부터는 같은 이메일의 다른 조직이 이 프로필을 잡지 못한다.
+                file.accounts[idx].organizationUuid = identity.organizationUuid
+            }
             profile = file.accounts[idx]
         } else {
             profile = AccountProfile(id: UUID(), provider: provider, nickname: nickname,
                                      emailAddress: identity.emailAddress,
                                      organizationName: identity.organizationName,
-                                     tierDescription: identity.tierDescription)
+                                     tierDescription: identity.tierDescription,
+                                     organizationUuid: identity.organizationUuid)
             file.accounts.append(profile)
             if file.activeByProvider[provider] == nil {
                 file.activeByProvider[provider] = profile.id
@@ -95,9 +100,7 @@ public final class AccountStore: @unchecked Sendable {
     /// Claude 편의 경로 — 스냅샷에서 신원을 추출해 등록한다 (CLI capture·LoginFlow용).
     @discardableResult
     public func upsertProfile(nickname: String, snapshot: CredentialsSnapshot) throws -> AccountProfile {
-        guard let oauthJSON = snapshot.oauthAccountJSON,
-              let block = try JSONSerialization.jsonObject(with: oauthJSON) as? [String: Any],
-              let identity = ClaudeConfigIO.identity(fromOAuthBlock: block) else {
+        guard let identity = ClaudeConfigIO.identity(fromSnapshot: snapshot) else {
             throw AccountStoreError.snapshotMissingEmail
         }
         return try upsertProfile(nickname: nickname, provider: .claude, identity: identity,

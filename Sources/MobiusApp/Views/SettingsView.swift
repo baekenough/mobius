@@ -274,6 +274,12 @@ struct SettingsView: View {
                     .foregroundStyle(.green)
             }
             Spacer()
+            // 같은 이메일이 조직마다 별개 계정이므로 이메일만으로는 행이 구분되지 않는다 —
+            // 카드와 같은 부제(회사 조직 이름 · 등급)를 옆에 적는다(리뷰 지적).
+            if !p.subtitle.isEmpty {
+                Text(p.subtitle).font(.system(size: 10.5)).foregroundStyle(.tertiary)
+                    .lineLimit(1).truncationMode(.tail)
+            }
             Text(p.emailAddress).font(.system(size: 10.5)).foregroundStyle(.secondary)
                 .lineLimit(1).truncationMode(.middle)
         }

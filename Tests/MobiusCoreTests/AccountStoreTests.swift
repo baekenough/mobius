@@ -12,12 +12,13 @@ final class AccountStoreTests: XCTestCase {
     }
     override func tearDownWithError() throws { try? FileManager.default.removeItem(at: tmp) }
 
-    func snap(email: String) -> CredentialsSnapshot {
-        CredentialsSnapshot(
-            keychainBlob: Data("blob-\(email)".utf8),
-            credentialsFileData: Data("file-\(email)".utf8),
+    func snap(email: String, org: String = "") -> CredentialsSnapshot {
+        let orgField = org.isEmpty ? "" : #","organizationUuid":"\#(org)""#
+        return CredentialsSnapshot(
+            keychainBlob: Data("blob-\(email)-\(org)".utf8),
+            credentialsFileData: Data("file-\(email)-\(org)".utf8),
             oauthAccountJSON: Data(
-                #"{"emailAddress":"\#(email)","organizationName":"Org","organizationRateLimitTier":"default_claude_max_20x"}"#.utf8))
+                #"{"emailAddress":"\#(email)","organizationName":"Org","organizationRateLimitTier":"default_claude_max_20x"\#(orgField)}"#.utf8))
     }
 
     func testUpsertNewAndDuplicateEmail() throws {
@@ -31,7 +32,47 @@ final class AccountStoreTests: XCTestCase {
         let p1b = try store.upsertProfile(nickname: "personal", snapshot: snap(email: "p@x.com"))
         XCTAssertEqual(store.file.accounts.count, 1)
         XCTAssertEqual(p1b.id, p1.id)
-        XCTAssertEqual(try store.secret(for: p1.id)?.keychainBlob, Data("blob-p@x.com".utf8))
+        XCTAssertEqual(try store.secret(for: p1.id)?.keychainBlob, Data("blob-p@x.com-".utf8))
+    }
+
+    // MARK: 계정 열쇠 = 이메일 + 조직 (실패 기록 23)
+
+    /// 같은 이메일이라도 조직이 다르면 **별개 프로필**이다 — 회사 Team과 개인 Max를 한 이메일로
+    /// 쓰는 사용자의 두 번째 로그인이 첫 프로필(과 그 토큰)을 덮어쓰면 안 된다.
+    func testUpsertSameEmailDifferentOrganizationCreatesSeparateProfiles() throws {
+        let store = try AccountStore(env: env, keychain: kc)
+        let team = try store.upsertProfile(nickname: "team", snapshot: snap(email: "p@x.com", org: "org-team"))
+        let max = try store.upsertProfile(nickname: "max", snapshot: snap(email: "p@x.com", org: "org-max"))
+        XCTAssertEqual(store.file.accounts.count, 2)
+        XCTAssertNotEqual(team.id, max.id)
+        XCTAssertEqual(store.file.activeAccountID, team.id, "첫 계정이 활성으로 유지된다")
+        // 각자의 토큰이 각자에게 남아 있다
+        XCTAssertEqual(try store.secret(for: team.id)?.keychainBlob, Data("blob-p@x.com-org-team".utf8))
+        XCTAssertEqual(try store.secret(for: max.id)?.keychainBlob, Data("blob-p@x.com-org-max".utf8))
+        // 같은 조직 재캡처는 갱신
+        let teamAgain = try store.upsertProfile(nickname: "team2", snapshot: snap(email: "p@x.com", org: "org-team"))
+        XCTAssertEqual(teamAgain.id, team.id)
+        XCTAssertEqual(store.file.accounts.count, 2)
+        XCTAssertEqual(store.file.accounts.first { $0.id == team.id }?.nickname, "team2")
+        // 영속 확인
+        let store2 = try AccountStore(env: env, keychain: kc)
+        XCTAssertEqual(store2.file.accounts.map(\.organizationUuid), ["org-team", "org-max"])
+    }
+
+    /// 조직을 모르던 구버전 프로필은 이메일로 맞고, 그 순간 조직이 채워진다 — 이후로는 같은 이메일의
+    /// 다른 조직이 이 프로필을 잡지 못한다.
+    func testUpsertBackfillsOrganizationOnLegacyProfileThenSeparates() throws {
+        let store = try AccountStore(env: env, keychain: kc)
+        let legacy = try store.upsertProfile(nickname: "old", snapshot: snap(email: "p@x.com"))
+        XCTAssertEqual(store.file.accounts[0].organizationUuid, "")
+
+        let filled = try store.upsertProfile(nickname: "old", snapshot: snap(email: "p@x.com", org: "org-A"))
+        XCTAssertEqual(filled.id, legacy.id, "조직 미상 프로필은 이메일로 맞는다(구버전 동작)")
+        XCTAssertEqual(store.file.accounts[0].organizationUuid, "org-A")
+
+        let other = try store.upsertProfile(nickname: "other", snapshot: snap(email: "p@x.com", org: "org-B"))
+        XCTAssertNotEqual(other.id, legacy.id, "조직이 채워진 뒤에는 다른 조직이 새 프로필이 된다")
+        XCTAssertEqual(store.file.accounts.count, 2)
     }
 
     func testPersistenceRoundtrip() throws {
@@ -220,6 +261,7 @@ final class AccountStoreTests: XCTestCase {
         XCTAssertEqual(f.accounts[0].nickname, "fore.st")
         XCTAssertFalse(f.accounts[0].userPinned)          // 기본값
         XCTAssertEqual(f.accounts[0].rateLimit?.modelScoped, false) // 기본값
+        XCTAssertEqual(f.accounts[0].organizationUuid, "")  // 기본값(조직 미상 → 이메일로 대조)
     }
 
     func testCorruptFileIsBackedUpNotLost() throws {
