@@ -83,18 +83,27 @@ public final class AutoSwitchEngine: @unchecked Sendable {
     ///   소진돼 떠나는 경우엔 모델 한도가 걸린 계정도 **정상 후보다** — 계정은 멀쩡하고
     ///   사용자는 다른 모델을 쓸 수 있다(이슈 #19 후속: 이걸 구분 안 하면 며칠짜리 모델
     ///   한도 하나가 폴백을 통째로 지워 "모든 계정 한도 소진"이 난다).
+    /// - Parameter modelBlocked: **사용량 캐시가 모델 창 소진을 보여주는 계정들**(호출자가
+    ///   `UsageSnapshot.modelWindowBlocked`로 계산). `isModelLimited`는 그 계정이 **활성일 때
+    ///   hit을 맞아야** 생기는 기록이라, 한 번도 활성이 아니었던 폴백은 Fable이 100%여도 기록이
+    ///   없다 — 그 폴백으로 옮기면 사용자는 같은 에러를 다시 보고, 그제서야 기록이 생겨 다음
+    ///   폴백으로 또 옮긴다(실패 기록 22: 폴백마다 한 번씩 헛돈다). 모델 한도 때문에 떠날 때만
+    ///   본다 — 계정 소진으로 떠날 때는 모델이 막힌 계정도 정상 후보(위와 같은 이유).
     private func firstAvailable(in file: AccountsFile, excluding: UUID?, now: Date,
-                                avoidModelLimited: Bool = false) -> UUID? {
+                                avoidModelLimited: Bool = false,
+                                modelBlocked: Set<UUID> = []) -> UUID? {
         file.accounts(of: provider).first {
             $0.id != excluding && !$0.isLimited(now: now) && !$0.needsReauth
-                && !(avoidModelLimited && $0.isModelLimited(now: now))
+                && !(avoidModelLimited && ($0.isModelLimited(now: now) || modelBlocked.contains($0.id)))
         }?.id
     }
 
     /// 활성 계정에서 rate-limit 이벤트 발생.
     /// 쿨다운 내 hit는 무시 — 전환 직후 구 세션이 계속 남기는 stale 로그를
     /// 새 활성 계정의 소진으로 오인해 연쇄 전환(B→C→D)되는 것을 막는다.
-    public func onRateLimitHit(file: AccountsFile, hit: RateLimitHit, now: Date) -> Decision {
+    /// - Parameter modelBlocked: 사용량 캐시상 모델 창이 소진된 계정들 — `firstAvailable` 참조.
+    public func onRateLimitHit(file: AccountsFile, hit: RateLimitHit, now: Date,
+                               modelBlocked: Set<UUID> = []) -> Decision {
         guard let active = file.active(of: provider), !inCooldown(now) else { return .none }
         // 모델 전용 한도(Fable 등) + 사용자가 이 계정을 직접 고름(pin) → 전환하지 않고 머문다.
         // 계정은 다른 모델로 쓸 수 있고, 사용자가 "여기 있겠다"고 이미 선택했으므로.
@@ -109,7 +118,8 @@ public final class AutoSwitchEngine: @unchecked Sendable {
         }
         guard let next = firstAvailable(in: markedFile(file, activeID: active.id, hit: hit, now: now),
                                         excluding: active.id, now: now,
-                                        avoidModelLimited: hit.modelScoped) else {
+                                        avoidModelLimited: hit.modelScoped,
+                                        modelBlocked: modelBlocked) else {
             // ★ 모델 전용 한도인데 갈 곳이 없다 = 어디로 옮겨도 그 모델은 막혀 있다.
             //   이때 "모든 계정 한도 소진"은 **거짓말이다** — 계정들은 멀쩡하고 다른 모델은
             //   쓸 수 있다. 조용히 머문다(사용자는 CLI 에러로 이미 상황을 안다).
@@ -133,7 +143,8 @@ public final class AutoSwitchEngine: @unchecked Sendable {
 
     /// 주기 틱: (A) 활성 계정이 소진 상태면 여유 있는 계정으로 자가 전환,
     ///          (B) fallback 활성이 자동 전환의 결과라면 primary 리셋 시 복귀.
-    public func onTick(file: AccountsFile, now: Date) -> Decision {
+    /// - Parameter modelBlocked: 사용량 캐시상 모델 창이 소진된 계정들 — `firstAvailable` 참조.
+    public func onTick(file: AccountsFile, now: Date, modelBlocked: Set<UUID> = []) -> Decision {
         guard file.isAutoSwitchEnabled(provider), !inCooldown(now),
               let active = file.active(of: provider) else { return .none }
 
@@ -148,7 +159,8 @@ public final class AutoSwitchEngine: @unchecked Sendable {
             && active.isModelLimited(now: now)
         if active.autoSwitchMayLeave(now: now),
            let next = firstAvailable(in: file, excluding: active.id, now: now,
-                                     avoidModelLimited: leavingForModelLimit) {
+                                     avoidModelLimited: leavingForModelLimit,
+                                     modelBlocked: modelBlocked) {
             return .switchTo(next, reason: leavingForModelLimit ? .modelExhausted
                                                                 : .activeExhausted)
         }

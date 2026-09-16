@@ -584,4 +584,42 @@ final class AutoSwitchEngineTests: XCTestCase {
         let measuredRetryCeiling: TimeInterval = 127   // 2m07s, 실측 상한
         XCTAssertGreaterThan(AutoSwitchEngine().cooldown, measuredRetryCeiling)
     }
+
+    // MARK: 사용량 캐시 기반 모델 창 소진 후보 제외 (실패 기록 22)
+    // 폴백의 rateLimit 기록은 활성일 때 hit을 맞아야 생긴다. 한 번도 활성이 아니었던 폴백은
+    // 게이지에 Fable 100%가 떠 있어도 기록이 없어 정상 후보로 뽑히고, 옮긴 뒤 같은 에러를 맞고
+    // 그제서야 기록이 생겨 다음 폴백으로 또 옮긴다 — 폴백마다 한 번씩 헛돈다.
+
+    func testModelLimitedHitSkipsFallbackWhoseUsageShowsModelExhausted() {
+        // fb1은 기록은 없지만 사용량 캐시가 Fable 소진을 보여준다 → fb2로
+        let hit = RateLimitHit(resetsAt: t0.addingTimeInterval(5 * 86400), modelScoped: true)
+        let d = AutoSwitchEngine().onRateLimitHit(file: file, hit: hit, now: t0,
+                                                  modelBlocked: [fb1.id])
+        XCTAssertEqual(d, .switchTo(fb2.id, reason: .modelExhausted))
+    }
+
+    func testModelLimitedHitStaysWhenAllFallbacksModelExhaustedByUsage() {
+        // 갈 곳이 전부 Fable 소진 = 어디로 가도 같은 에러 → 조용히 머문다("모든 계정 소진" 아님)
+        let hit = RateLimitHit(resetsAt: t0.addingTimeInterval(5 * 86400), modelScoped: true)
+        let d = AutoSwitchEngine().onRateLimitHit(file: file, hit: hit, now: t0,
+                                                  modelBlocked: [fb1.id, fb2.id])
+        XCTAssertEqual(d, .none)
+    }
+
+    func testModelLimitedLeaveOnTickSkipsUsageBlockedFallback() {
+        // 자가복구 틱 경로도 같은 규칙
+        file.accounts[0].rateLimit = RateLimitInfo(
+            resetsAt: t0.addingTimeInterval(5 * 86400), recordedAt: t0, modelScoped: true)
+        let d = AutoSwitchEngine().onTick(file: file, now: t0, modelBlocked: [fb1.id])
+        XCTAssertEqual(d, .switchTo(fb2.id, reason: .modelExhausted))
+    }
+
+    func testAccountExhaustedLeaveIgnoresUsageModelBlock() {
+        // ★ 계정 자체 소진으로 떠날 때는 모델이 막힌 폴백도 정상 후보다 — 계정은 멀쩡하고
+        //   사용자는 다른 모델을 쓸 수 있다. 여기까지 걸러내면 이슈 #19의 "모든 계정 소진"이 재발한다.
+        let hit = RateLimitHit(resetsAt: t0.addingTimeInterval(3600))   // modelScoped=false
+        let d = AutoSwitchEngine().onRateLimitHit(file: file, hit: hit, now: t0,
+                                                  modelBlocked: [fb1.id, fb2.id])
+        XCTAssertEqual(d, .switchTo(fb1.id, reason: .activeExhausted))
+    }
 }

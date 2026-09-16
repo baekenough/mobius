@@ -77,6 +77,25 @@ public struct UsageSnapshot: Codable, Equatable, Sendable {
         }
     }
 
+    /// 이 계정의 **모델 전용 창**이 지금 막혀 있는가 — 자동 전환 후보에서 뺄지 판정한다(실패 기록 22).
+    ///
+    /// `scopedExhaustionHit`과 갈리는 지점은 **리셋 시각이 없는 100%**다. 그쪽은 `RateLimitHit`을
+    /// 만들어야 해서 시각이 반드시 필요하지만, 여기서는 "그 모델을 지금 쓸 수 있는가"만 물으므로
+    /// 시각을 몰라도 막힌 것으로 본다 — `weekly_scoped`의 `resets_at`은 실제로 null로 온다
+    /// (실패 기록 21). 그때도 카드 게이지는 100%를 그대로 그리므로(`AccountCardView.gaugeRow`),
+    /// 시각이 없다고 후보로 두면 화면이 보여주는 것과 전환 결정이 어긋난다.
+    ///
+    /// 리셋이 **이미 지난** 항목은 제외한다 — 낡은 캐시가 계정을 무기한 묶지 않게.
+    /// (`hasUnresolvableScopedLimit`을 그대로 쓰면 안 되는 이유가 이것이다. 그쪽은 "판정 보류"를
+    /// 가리는 술어라 지난 창도 true다.)
+    public func modelWindowBlocked(now: Date) -> Bool {
+        (scopedLimits ?? []).contains { limit in
+            guard limit.percent >= 100 else { return false }
+            guard let reset = limit.resetsAt else { return true }   // 시각을 몰라도 100%면 막힘
+            return reset > now                                      // 지난 창은 이미 풀렸다
+        }
+    }
+
     /// **계정 창**(5시간/주간) 중 100%인 것이 있는가(리셋 시각의 유효성과 무관).
     /// `.inconclusive` 판정용 — "여유 있음"과 "소진인데 리셋 시각을 못 얻음"을 가른다.
     /// ★ 모델 전용 한도는 **일부러 제외한다**: 며칠 100%로 남아 있을 수 있어서, 포함하면

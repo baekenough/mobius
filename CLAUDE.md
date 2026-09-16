@@ -35,7 +35,8 @@ Sources/MobiusCore/       앱·CLI 공유 코어 (전부 의존성 주입 → �
   CodexStatusRouter.swift  Codex 상태의 계정 귀속 — 전환 전 세션 파일 격리 (오염 방지 ★아래)
   SessionLogWatcher.swift  세션 로그 tail — (루트, 파서, 정책) 주입 제네릭 (네트워크 0)
   AutoSwitchEngine.swift   순수 상태머신, 풀당 1인스턴스 (쿨다운/마진/autoSwitchedFromPrimary,
-                           on/off는 풀별 autoSwitchByProvider — 기록 없는 풀은 켬; 모델스코프 pin)
+                           on/off는 풀별 autoSwitchByProvider — 기록 없는 풀은 켬; 모델스코프 pin;
+                           modelBlocked = 호출자가 usage 캐시로 계산한 "모델 창 소진" 계정 집합)
   UsageFetcher.swift       Claude usage 엔드포인트 조회 (게이지용, 팝오버 열 때만; Codex는 로그로 대체)
                            모델 스코프 주간 한도(weekly_scoped)도 파싱 → ScopedUsageLimit
   SyncEngine.swift         멀티 Mac 동기화 (클라우드 폴더 미러, ★ 아래 '동기화 원칙')
@@ -580,6 +581,46 @@ Sources/MobiusApp/        SwiftUI 메뉴바 앱 + AppState + Views/ + LoginFlow 
     사용자에게 거짓말이 된다(`notifyModelLimitedOnly`, `SwitchReason.modelExhausted`).
     (3) 개발 Mac 세션 로그 한 달치에 창 소진 이벤트가 **0건**이었다 — 자체 발견이 사실상
     불가능한, 규모가 조건인 버그(13·17·20과 같은 클래스). 외부 제보가 유일한 발견 경로다.
+22. **모델 한도로 떠날 때 후보를 "기록"으로만 걸러 Fable 100%인 폴백으로 옮김 (외부 제보, 2026-09-11)** —
+    `firstAvailable(avoidModelLimited:)`는 `isModelLimited`(= 그 계정의 `rateLimit` 기록)만 봤다.
+    그 기록은 **그 계정이 활성일 때 hit을 맞아야** 생기므로, 한 번도 활성이 아니었던 폴백은
+    게이지에 Fable 100%가 떠 있어도 기록이 없어 정상 후보로 뽑힌다. 사용자(Fable 사용 중)가
+    옮겨진 폴백에서 같은 에러를 맞고 → usage 검증으로 그제서야 기록 → 쿨다운(180초) 뒤 다음
+    폴백으로 또 이동 — 폴백마다 한 번씩 헛돌며 "계속 Fable이 가득 찬 워크스페이스로 바뀐다"고
+    보인다. 같은 이메일의 회사 Team·Enterprise가 폴백으로 붙은 구성(Fable은 조직마다 따로
+    소진)에서 바로 드러났다.
+    → 엔진 `onRateLimitHit`/`onTick`에 `modelBlocked: Set<UUID>`를 받고, AppState가
+    `usage[id].modelWindowBlocked(now:)`(팝오버·advisory 폴링이 채운 캐시, 네트워크 0)로 계산해
+    넘긴다. **모델 한도 때문에 떠날 때만** 거른다 — 계정 소진으로 떠날 때 걸러내면 이슈 #19의
+    "모든 계정 소진"이 재발한다(테스트로 못 박음). 캐시가 없는 계정은 모른다고 보고 후보로 둔다
+    (예전 동작).
+    ★ 술어를 `scopedExhaustionHit`으로 두면 **이 수정이 노린 상황에서 그대로 무력화된다** —
+    그쪽은 `RateLimitHit`을 만들려고 `compactMap(\.resetsAt)`을 거치는데, `weekly_scoped`의
+    `resets_at`은 실제로 null로 온다(실패 기록 21). 카드 게이지는 시각 없이도 100%를 그리므로
+    (`AccountCardView.gaugeRow`) 그 부분집합에서 화면과 결정이 어긋난 채 남는다. 그래서
+    "100%이고 리셋을 모르거나 아직 안 지났으면 막힘"인 `UsageSnapshot.modelWindowBlocked`를
+    따로 뒀다. `hasUnresolvableScopedLimit`을 재사용하면 안 된다 — 그쪽은 "판정 보류"를 가리는
+    술어라 **이미 지난 창도 true**여서 낡은 캐시가 계정을 무기한 묶는다.
+    ★ 판정은 MobiusCore 순수 함수에 두고 AppState는 집합만 만든다 — AppState는 XCTest 타깃이
+    없어서, 분기가 있는 술어를 거기 두면 정작 결함이 사는 자리에 테스트가 닿지 않는다.
+    ★ `tick()` 경로는 `loadUsageCacheIfNeeded()`를 **직접 불러야** 한다. 그 호출은 팝오버
+    `onAppear`(`refreshUsageIfStale`)와 hit 검증에만 있어서, 앱을 켜고 팝오버를 한 번도 안 열면
+    `usage`가 통째로 비어 필터가 늘 빈 집합이 된다 — `usageCacheV1`에 멀쩡한 캐시가 있어도 그렇다.
+    비활성 계정의 캐시를 채우는 유일한 경로인 `refreshUsageIfStale`는 `showUsageGauges`로
+    게이트되므로, **게이지 표시를 끈 사용자에게 이 필터는 사실상 없는 기능이다.** 실패 기록 19의
+    "자동 전환 정확성을 표시 설정에 종속시키지 말라"와 같은 클래스는 아니다 — 여기서는 모르면
+    후보로 두는 fail-open이라 한 번 켜지면 안 꺼지는 래치가 생기지 않는다. 대신 모든 폴백이
+    걸러지면 결과가 `.none` = **알림도 전환도 없는 완전 침묵**이라, 낡은 캐시가 오탐을 내면
+    사용자는 아무 일도 안 일어나는 것만 본다. 리셋 시각 필터가 그 위험을 낮추지만 의식적 선택이다.
+    남는 것: (1) 이슈 #24 "함께 볼 것"의 모델 라벨 스키마(어느 모델이 막혔는지) — 지금은 스코프
+    창이 Fable 하나라 라벨 없이도 맞지만, 둘 이상이 되면 hit의 모델과 폴백의 소진 모델을 대조해야
+    한다. (2) **primary 복귀 경로(B)는 아직 `primary.rateLimit` 기록만 본다** — `RateLimitInfo`
+    슬롯이 하나뿐이라 계정 한도 기록이 모델 기록을 덮으면, 게이지는 Fable 100%를 아는데 복귀했다가
+    곧바로 다시 떠나는 왕복이 난다. 둘 다 모델 라벨 스키마와 같은 묶음에서 풀린다.
+    교훈: 후보를 거르는 조건과 그 조건의 **정보원**이 다르면(기록 vs 게이지) 한쪽만 아는 사실이
+    결정에서 빠진다 — 게이지가 이미 아는 것을 결정이 모르면 사용자는 화면과 동작이 어긋난다고 느낀다.
+    정보원을 바꿔 붙일 때는 **그 정보원이 쓰던 술어를 그대로 재사용하지 말고** 무엇을 묻는
+    술어인지부터 확인한다. 같은 필드를 읽어도 "hit을 만든다"와 "지금 쓸 수 있는가"는 경계가 다르다.
 
 ## QA / 진행 상황
 

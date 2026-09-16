@@ -108,6 +108,60 @@ final class UsageFetcherTests: XCTestCase {
         XCTAssertNil(stale.exhaustionHit(now: now))
     }
 
+    /// 자동 전환 후보 제외용 술어 — `scopedExhaustionHit`과 **일부러 갈리는** 지점을 못 박는다
+    /// (실패 기록 22). 후보 제외는 "그 모델을 지금 쓸 수 있는가"만 물으므로 리셋 시각을 몰라도
+    /// 100%면 막힌 것으로 본다. `RateLimitHit`을 만들어야 해서 시각이 필수인 쪽과 다르다.
+    func testModelWindowBlockedCoversScopedLimitWithoutResetTime() {
+        let now = Date(timeIntervalSince1970: 1_784_300_000)
+        func snap(_ percent: Double, resetsAt: Date?) -> UsageSnapshot {
+            UsageSnapshot(fiveHourPercent: 12, fiveHourResetsAt: now.addingTimeInterval(3600),
+                          sevenDayPercent: 30, sevenDayResetsAt: now.addingTimeInterval(86_400),
+                          scopedLimits: [ScopedUsageLimit(label: "Fable", percent: percent,
+                                                          resetsAt: resetsAt)],
+                          fetchedAt: now)
+        }
+        // (a) 100% + 리셋이 미래 → 막힘. 두 술어가 같이 잡는다.
+        let future = snap(100, resetsAt: now.addingTimeInterval(86_400))
+        XCTAssertTrue(future.modelWindowBlocked(now: now))
+        XCTAssertNotNil(future.scopedExhaustionHit(now: now))
+        // (b) ★ 100% + 리셋 시각 없음 → 막힘. 여기가 두 술어가 갈리는 지점이다 —
+        //     `weekly_scoped`의 `resets_at`은 실제로 null로 온다(실패 기록 21). 카드 게이지는
+        //     시각이 없어도 100%를 그리므로, 여기서 놓치면 화면과 전환 결정이 어긋난다.
+        let noReset = snap(100, resetsAt: nil)
+        XCTAssertTrue(noReset.modelWindowBlocked(now: now))
+        XCTAssertNil(noReset.scopedExhaustionHit(now: now))
+        // (c) 100%지만 리셋이 이미 지남 → 안 막힘. 낡은 캐시가 계정을 무기한 묶지 않게 한다.
+        //     `hasUnresolvableScopedLimit`을 그대로 못 쓰는 이유가 이 분기다(그쪽은 true).
+        let past = snap(100, resetsAt: now.addingTimeInterval(-60))
+        XCTAssertFalse(past.modelWindowBlocked(now: now))
+        XCTAssertTrue(past.hasUnresolvableScopedLimit(now: now))
+        // (d) 100% 미만이면 리셋 시각 유무와 무관하게 안 막힘
+        XCTAssertFalse(snap(99, resetsAt: nil).modelWindowBlocked(now: now))
+        XCTAssertFalse(snap(99, resetsAt: now.addingTimeInterval(86_400)).modelWindowBlocked(now: now))
+        // (e) 스코프 한도 자체가 없으면(구버전 캐시 포함) 안 막힘 = 후보 유지(예전 동작)
+        XCTAssertFalse(UsageSnapshot(fiveHourPercent: 10, fiveHourResetsAt: nil,
+                                     sevenDayPercent: 20, sevenDayResetsAt: nil,
+                                     fetchedAt: now).modelWindowBlocked(now: now))
+    }
+
+    /// 위 (b)를 **라이브 응답 모양 그대로** 한 줄기로 못 박는다 — `resets_at` 없이 온
+    /// `weekly_scoped` 100%가 파싱을 거쳐 판정까지 살아남는지. 게이지는 이 값으로 100%를
+    /// 그리므로(`scopedLimits`), 판정이 못 잡으면 화면과 전환 결정이 어긋난 채 남는다.
+    func testScopedLimitWithoutResetTimeSurvivesParseIntoBlockedVerdict() {
+        let now = Date(timeIntervalSince1970: 1_784_300_000)
+        let json = Data(#"""
+        {"five_hour":{"utilization":12,"resets_at":"2026-09-14T12:00:00.000000Z"},
+         "seven_day":{"utilization":30,"resets_at":"2026-09-20T12:00:00.000000Z"},
+         "limits":[{"kind":"weekly_scoped","group":"weekly","percent":100,
+                    "scope":{"model":{"display_name":"Fable"}}}]}
+        """#.utf8)
+        let snap = UsageFetcher.parse(json, now: now)
+        XCTAssertEqual(snap?.scopedLimits?.first?.percent, 100)   // 게이지엔 100%로 보인다
+        XCTAssertNil(snap?.scopedLimits?.first?.resetsAt)         // 시각은 안 온다(실패 기록 21)
+        XCTAssertNil(snap?.scopedExhaustionHit(now: now))         // hit은 못 만든다 — 시각이 없으니
+        XCTAssertEqual(snap?.modelWindowBlocked(now: now), true)  // ★ 후보 제외는 그래도 성립한다
+    }
+
     func testExpiresAtParsing() {
         // 실측: claudeAiOauth.expiresAt는 13자리 epoch 밀리초 (2026-07-11 확인)
         let ms = Data(#"{"claudeAiOauth":{"expiresAt":1783785648000}}"#.utf8)

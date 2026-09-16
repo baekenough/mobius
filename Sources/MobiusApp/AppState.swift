@@ -942,10 +942,31 @@ final class AppState: ObservableObject {
         await processCodexBatches(codexBatches, now: now)
 
         for provider in Provider.allCases {
-            await apply(engines[provider]!.onTick(file: store.file, now: now),
+            await apply(engines[provider]!.onTick(file: store.file, now: now,
+                                                  modelBlocked: modelBlockedByUsage(provider, now: now)),
                         provider: provider, now: now)
         }
         file = store.file
+    }
+
+    /// 사용량 캐시가 **모델 전용 창 소진**(Fable 100%)을 보여주는 계정들. 엔진이 모델 한도 때문에
+    /// 떠날 때 후보에서 뺀다 — 폴백의 `rateLimit` 기록은 그 계정이 활성일 때 hit을 맞아야 생기므로,
+    /// 게이지에 100%가 떠 있어도 기록이 없는 폴백으로 옮겨 헛도는 것을 막는다(실패 기록 22).
+    /// 네트워크 0 — 팝오버·advisory 폴링이 채워 둔 캐시만 읽고, 캐시가 없는 계정은 모른다고 본다
+    /// (= 후보 유지, 예전 동작). `modelWindowBlocked`는 리셋 시각이 지난 항목을 무시하므로
+    /// 캐시가 낡아도 지난 창으로 계정을 오래 묶어 두지 않는다.
+    ///
+    /// ★ 판정 자체는 `UsageSnapshot.modelWindowBlocked`(MobiusCore 순수 함수)에 있다 —
+    ///   AppState는 XCTest 타깃이 없어서, 분기가 있는 술어를 여기 두면 테스트가 닿지 않는다.
+    private func modelBlockedByUsage(_ provider: Provider, now: Date) -> Set<UUID> {
+        guard provider == .claude else { return [] }   // Codex에는 모델 스코프 창이 없다
+        // ★ 디스크 캐시를 먼저 올린다(멱등). 이 호출이 없으면 `tick()` 경로에서는 팝오버를 한 번도
+        //   안 연 세션의 `usage`가 통째로 비어 있어 필터가 늘 빈 집합이 된다 — `usageCacheV1`에
+        //   멀쩡한 캐시가 저장돼 있어도 그렇다. hit 검증 경로가 같은 이유로 같은 호출을 한다.
+        loadUsageCacheIfNeeded()
+        return Set(store.file.accounts(of: .claude).compactMap { p in
+            usage[p.id]?.modelWindowBlocked(now: now) == true ? p.id : nil
+        })
     }
 
     private func recordHit(_ hit: RateLimitHit, on accountID: UUID?, now: Date) {
@@ -1251,7 +1272,8 @@ final class AppState: ObservableObject {
         //   엉뚱한 계정을 소진으로 보고 결정한다. 기록만 남기고 나머지는 onTick에 맡긴다.
         if store.file.activeByProvider[.claude] == accountID {
             await apply(engines[.claude]!.onRateLimitHit(file: store.file, hit: verified,
-                                                         now: verifiedAt),
+                                                         now: verifiedAt,
+                                                         modelBlocked: modelBlockedByUsage(.claude, now: verifiedAt)),
                         provider: .claude, now: verifiedAt)
         }
         file = store.file
